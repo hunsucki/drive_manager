@@ -1,0 +1,30 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python packaging outputs
+*.egg-info/
+dist/
+build/
+
+# ROS/colcon workspace outputs
+/install/
+/log/
+
+# Coverage and test outputs
+.coverage
+htmlcov/
+
+# Local editor and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Runtime logs
+*.log

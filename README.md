@@ -26,16 +26,27 @@ source /root/colcon_ws/install/setup.bash
 ros2 run drive_manager two_point
 ```
 
-## Mobile Command Manager 실행
+## Mobile Mission 실행
 
-모바일 앱은 `/robot_command`에 `std_msgs/msg/String` 명령을 publish합니다.
-`command_manager`는 앱 명령을 `/mission_command`로 전달하고,
-`mission_driver`가 Nav2 액션으로 실제 주행을 수행합니다.
+`drive_manager.launch.py`는 모바일 앱 연동에 필요한 세 노드를 함께 실행합니다.
+
+- `rosbridge_websocket`: 모바일 앱 WebSocket 연결용입니다. 기본 포트는 `9090`입니다.
+- `command_manager`: 앱 명령 `/robot_command`를 받아 내부 명령 `/mission_command`로 전달합니다.
+- `mission_driver`: `param/mission_config.yaml`을 읽고 Nav2 `/navigate_to_pose` 액션으로 실제 주행을 수행합니다.
 
 ```bash
 source /root/colcon_ws/install/setup.bash
 ros2 launch drive_manager drive_manager.launch.py
 ```
+
+실제 주행 전에는 Nav2가 먼저 실행되어 있어야 합니다.
+
+```bash
+source /root/colcon_ws/install/setup.bash
+ros2 launch drive_manager nav2_headless.launch.py
+```
+
+## 앱 명령
 
 명령 예시:
 
@@ -47,43 +58,123 @@ ros2 topic pub --once /robot_command std_msgs/msg/String "{data: ESTOP}"
 ros2 topic pub --once /robot_command std_msgs/msg/String "{data: RESET}"
 ```
 
+rosbridge WebSocket에서 직접 publish할 때는 아래 JSON을 보냅니다.
+
+```json
+{
+  "op": "publish",
+  "topic": "/robot_command",
+  "msg": {
+    "data": "START"
+  }
+}
+```
+
 상태 확인:
 
 ```bash
 ros2 topic echo /robot_status
 ```
 
+앱에서 상태를 구독할 때는 `/robot_status`를 subscribe합니다.
+
+```json
+{
+  "op": "subscribe",
+  "topic": "/robot_status",
+  "type": "std_msgs/String"
+}
+```
+
+명령 동작:
+
+- `START`: dock 출발 escape 후, home_to_patrol_pose로 이동하고, patrol_points를 순회한 뒤 home_to_dock_pose로 돌아와 SSH 도킹 명령을 실행합니다.
+- `HOME`: 어디에 있든 현재 미션을 중단하고 home_to_dock_pose로 이동한 뒤 SSH 도킹 명령을 실행합니다.
+- `STOP`: 현재 Nav2 goal 또는 도킹 SSH 프로세스를 중단하고 `/cmd_vel` 0을 발행합니다.
+- `ESTOP`: STOP과 같지만 latch 상태가 되어 `RESET` 전까지 START/HOME을 거부합니다.
+- `RESET`: ESTOP latch를 해제합니다.
+
+START 중 START를 다시 누르면 `mission_driver`가 `BUSY` 상태를 발행하고 기존 미션을 계속 진행합니다. START 중 HOME을 누르면 현재 goal을 취소하고 HOME 복귀 미션으로 전환합니다.
+
+## Mission 설정
+
 HOME 좌표와 START 순회 좌표는 `param/mission_config.yaml`에서 관리합니다.
 HOME 계열 좌표는 방향이 중요해서 yaw를 직접 넣고, 순회 포인트는 `[x, y]`만 넣습니다.
 순회 포인트의 yaw는 다음 목표 좌표를 바라보도록 `mission_driver`가 자동 계산합니다.
 
 ```yaml
+command_manager:
+  ros__parameters:
+    command_topic: "/robot_command"
+    status_topic: "/robot_status"
+    mission_command_topic: "/mission_command"
+    mission_status_topic: "/mission_status"
+
 mission_driver:
   ros__parameters:
-    home_to_patrol_pose: [-0.215, -0.045, 0.0]
-    home_to_dock_pose: [-0.215, -0.045, 3.141592653589793]
-    patrol_points: ["point_1"]
+    home_to_patrol_pose: [-0.265, 4.405, -1.5708]
+    home_to_dock_pose: [-0.265, 4.405, 1.5708]
+
+    patrol_points: ["point_1", "point_2", "point_3"]
     patrol:
-      point_1: [3.685, -0.045]
+      point_1: [-0.165, -0.145]
+      point_2: [3.735, -0.045]
+      point_3: [-0.165, -0.145]
 
     start_escape_enabled: true
     start_escape_linear_x: 0.10
+    start_escape_angular_z: 0.0
     start_escape_duration_sec: 2.0
+    start_escape_stop_sec: 0.5
 
     docking_mode: "ssh"
-    docking_ssh_user: "pi"
-    docking_ssh_host: "ROBOT_RASPBERRY_PI_IP"
+    docking_ssh_user: "user"
+    docking_ssh_host: "192.168.0.13"
     docking_ssh_port: 22
-    docking_ssh_identity_file: ""
+    docking_ssh_identity_file: "/root/.ssh/id_ed25519_drive_manager"
+    docking_ssh_strict_host_key_checking: "accept-new"
     docking_remote_setup_files:
       - "/opt/ros/jazzy/setup.bash"
-      # - "/home/pi/colcon_ws/install/setup.bash"
+      - "/home/user/colcon_ws/install/setup.bash"
     docking_remote_command: "ros2 run docking dock_turn_backup"
+    docking_timeout_sec: 120.0
+    docking_stop_grace_sec: 3.0
 ```
 
-SSH 공개키 로그인만 허용한 경우에는 `mission_driver`를 실행하는 PC의 공개키를
-라즈베리파이 `~/.ssh/authorized_keys`에 등록해야 합니다. 별도 키 파일을 쓴다면
-`docking_ssh_identity_file`에 private key 경로를 넣습니다.
+START 미션 순서는 항상 아래와 같습니다.
+
+```text
+START_ESCAPE
+-> HOME_TO_PATROL
+-> patrol_points 순서대로 순회
+-> HOME_TO_DOCK
+-> SSH docking command
+```
+
+`start_escape_*`는 도킹스테이션에서 바로 Nav2를 시작할 때 collision_monitor가 막는 상황을 피하기 위한 짧은 탈출 동작입니다. 현재 설정은 `/cmd_vel`로 0.1 m/s 전진을 2초 수행한 뒤 Nav2 주행을 시작합니다.
+
+## SSH 도킹
+
+도킹 단계에서는 `mission_driver`가 라즈베리파이에 SSH로 접속해서 아래 명령을 실행합니다.
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/user/colcon_ws/install/setup.bash
+ros2 run docking dock_turn_backup
+```
+
+SSH 접속 확인:
+
+```bash
+ssh -i /root/.ssh/id_ed25519_drive_manager user@192.168.0.13
+```
+
+도킹 실행 파일 확인:
+
+```bash
+ssh -i /root/.ssh/id_ed25519_drive_manager user@192.168.0.13 \
+  "bash -lc 'source /opt/ros/jazzy/setup.bash && source /home/user/colcon_ws/install/setup.bash && ros2 pkg executables docking | grep dock_turn_backup'"
+```
 
 ## 현재 ROS 2 토픽 정리
 

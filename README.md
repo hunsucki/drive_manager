@@ -26,6 +26,65 @@ source /root/colcon_ws/install/setup.bash
 ros2 run drive_manager two_point
 ```
 
+## Mobile Command Manager 실행
+
+모바일 앱은 `/robot_command`에 `std_msgs/msg/String` 명령을 publish합니다.
+`command_manager`는 앱 명령을 `/mission_command`로 전달하고,
+`mission_driver`가 Nav2 액션으로 실제 주행을 수행합니다.
+
+```bash
+source /root/colcon_ws/install/setup.bash
+ros2 launch drive_manager drive_manager.launch.py
+```
+
+명령 예시:
+
+```bash
+ros2 topic pub --once /robot_command std_msgs/msg/String "{data: START}"
+ros2 topic pub --once /robot_command std_msgs/msg/String "{data: HOME}"
+ros2 topic pub --once /robot_command std_msgs/msg/String "{data: STOP}"
+ros2 topic pub --once /robot_command std_msgs/msg/String "{data: ESTOP}"
+ros2 topic pub --once /robot_command std_msgs/msg/String "{data: RESET}"
+```
+
+상태 확인:
+
+```bash
+ros2 topic echo /robot_status
+```
+
+HOME 좌표와 START 순회 좌표는 `param/mission_config.yaml`에서 관리합니다.
+HOME 계열 좌표는 방향이 중요해서 yaw를 직접 넣고, 순회 포인트는 `[x, y]`만 넣습니다.
+순회 포인트의 yaw는 다음 목표 좌표를 바라보도록 `mission_driver`가 자동 계산합니다.
+
+```yaml
+mission_driver:
+  ros__parameters:
+    home_to_patrol_pose: [-0.215, -0.045, 0.0]
+    home_to_dock_pose: [-0.215, -0.045, 3.141592653589793]
+    patrol_points: ["point_1"]
+    patrol:
+      point_1: [3.685, -0.045]
+
+    start_escape_enabled: true
+    start_escape_linear_x: 0.10
+    start_escape_duration_sec: 2.0
+
+    docking_mode: "ssh"
+    docking_ssh_user: "pi"
+    docking_ssh_host: "ROBOT_RASPBERRY_PI_IP"
+    docking_ssh_port: 22
+    docking_ssh_identity_file: ""
+    docking_remote_setup_files:
+      - "/opt/ros/jazzy/setup.bash"
+      # - "/home/pi/colcon_ws/install/setup.bash"
+    docking_remote_command: "ros2 run docking dock_turn_backup"
+```
+
+SSH 공개키 로그인만 허용한 경우에는 `mission_driver`를 실행하는 PC의 공개키를
+라즈베리파이 `~/.ssh/authorized_keys`에 등록해야 합니다. 별도 키 파일을 쓴다면
+`docking_ssh_identity_file`에 private key 경로를 넣습니다.
+
 ## 현재 ROS 2 토픽 정리
 
 아래 내용은 실행 중인 ROS 2 그래프에서 다음 명령으로 수집했습니다.

@@ -33,6 +33,8 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
+            "command_manager = drive_manager.command_manager:main",
+            "mission_driver = drive_manager.mission_driver:main",
             "two_point = drive_manager.two_point:main",
         ],
     },

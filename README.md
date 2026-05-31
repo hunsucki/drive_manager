@@ -86,6 +86,24 @@ ros2 topic echo /robot_status
 }
 ```
 
+미션 좌표 확인:
+
+```bash
+ros2 topic echo /mission_route_points
+```
+
+웹 앱에서는 `/mission_route_points`를 `std_msgs/String`으로 구독한 뒤 `msg.data`를 JSON으로 파싱하면 됩니다.
+
+```json
+{
+  "op": "subscribe",
+  "topic": "/mission_route_points",
+  "type": "std_msgs/String"
+}
+```
+
+발행 데이터에는 `home_to_patrol_pose`, `home_to_dock_pose`, `patrol_points`, 그리고 실제 주행 순서와 자동 계산된 patrol yaw를 담은 `navigation_sequence`가 포함됩니다.
+
 명령 동작:
 
 - `START`: dock 출발 escape 후, home_to_patrol_pose로 이동하고, patrol_points를 순회한 뒤 home_to_dock_pose로 돌아와 SSH 도킹 명령을 실행합니다.
@@ -112,8 +130,11 @@ command_manager:
 
 mission_driver:
   ros__parameters:
+    route_points_topic: "/mission_route_points"
+    route_points_publish_period_sec: 1.0
+
     home_to_patrol_pose: [-0.265, 4.405, -1.5708]
-    home_to_dock_pose: [-0.265, 4.405, 1.5708]
+    home_to_dock_pose: [-0.265, 4.405, 1.0472]
 
     patrol_points: ["point_1", "point_2", "point_3"]
     patrol:

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import math
 import queue
 import shlex
@@ -17,6 +18,7 @@ from nav2_msgs.srv import ManageLifecycleNodes
 from rclpy.action import ActionClient
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import String
 
 
@@ -41,6 +43,8 @@ class MissionDriver(Node):
 
         self.declare_parameter_if_missing("mission_command_topic", "/mission_command")
         self.declare_parameter_if_missing("mission_status_topic", "/mission_status")
+        self.declare_parameter_if_missing("route_points_topic", "/mission_route_points")
+        self.declare_parameter_if_missing("route_points_publish_period_sec", 1.0)
         self.declare_parameter_if_missing("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter_if_missing("navigate_action", "/navigate_to_pose")
         self.declare_parameter_if_missing("ensure_nav2_active", True)
@@ -84,6 +88,11 @@ class MissionDriver(Node):
             self.get_parameter("mission_status_topic").value,
             10,
         )
+        self.route_points_pub = self.create_publisher(
+            String,
+            self.get_parameter("route_points_topic").value,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
         self.cmd_vel_pub = self.create_publisher(
             Twist,
             self.get_parameter("cmd_vel_topic").value,
@@ -114,9 +123,18 @@ class MissionDriver(Node):
         self.last_feedback_time = 0.0
 
         self.zero_timer = self.create_timer(0.1, self.zero_timer_callback)
+        route_points_period_sec = max(
+            0.1,
+            float(self.get_parameter("route_points_publish_period_sec").value),
+        )
+        self.route_points_timer = self.create_timer(
+            route_points_period_sec,
+            self.publish_route_points,
+        )
         self.worker = threading.Thread(target=self.worker_loop, daemon=True)
         self.worker.start()
 
+        self.publish_route_points()
         self.publish_status("IDLE")
         self.get_logger().info(
             f"Mission driver ready on {self.get_parameter('mission_command_topic').value}"
@@ -380,6 +398,81 @@ class MissionDriver(Node):
             f"y={home_to_dock_pose[1]:.3f}, "
             f"yaw={home_to_dock_pose[2]:.3f}"
         )
+
+    def build_route_points_payload(self):
+        home_to_patrol_pose = self.get_pose3_parameter("home_to_patrol_pose")
+        home_to_dock_pose = self.get_pose3_parameter("home_to_dock_pose")
+        patrol_points = self.get_patrol_points()
+        if (
+            home_to_patrol_pose is None
+            or home_to_dock_pose is None
+            or patrol_points is None
+        ):
+            return None
+
+        payload = {
+            "frame_id": "map",
+            "home_to_patrol_pose": self.pose3_to_dict(home_to_patrol_pose),
+            "home_to_dock_pose": self.pose3_to_dict(home_to_dock_pose),
+            "patrol_points": [
+                {
+                    "name": name,
+                    "x": x,
+                    "y": y,
+                }
+                for name, x, y in patrol_points
+            ],
+            "navigation_sequence": [
+                {
+                    "name": "HOME_TO_PATROL",
+                    "type": "home",
+                    **self.pose3_to_dict(home_to_patrol_pose),
+                }
+            ],
+        }
+
+        home_to_dock_xy = (home_to_dock_pose[0], home_to_dock_pose[1])
+        for index, (name, x, y) in enumerate(patrol_points):
+            if index + 1 < len(patrol_points):
+                _, next_x, next_y = patrol_points[index + 1]
+            else:
+                next_x, next_y = home_to_dock_xy
+
+            payload["navigation_sequence"].append(
+                {
+                    "name": name,
+                    "type": "patrol",
+                    "x": x,
+                    "y": y,
+                    "yaw": calc_yaw_from_to(x, y, next_x, next_y),
+                    "yaw_source": "next_target",
+                }
+            )
+
+        payload["navigation_sequence"].append(
+            {
+                "name": "HOME_TO_DOCK",
+                "type": "home",
+                **self.pose3_to_dict(home_to_dock_pose),
+            }
+        )
+        return payload
+
+    def pose3_to_dict(self, pose):
+        return {
+            "x": pose[0],
+            "y": pose[1],
+            "yaw": pose[2],
+        }
+
+    def publish_route_points(self):
+        payload = self.build_route_points_payload()
+        if payload is None:
+            return
+
+        msg = String()
+        msg.data = json.dumps(payload, separators=(",", ":"))
+        self.route_points_pub.publish(msg)
 
     def run_docking_step(self, command):
         docking_command = self.get_docking_command()

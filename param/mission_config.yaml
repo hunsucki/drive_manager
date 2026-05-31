@@ -9,6 +9,8 @@ mission_driver:
   ros__parameters:
     mission_command_topic: "/mission_command"
     mission_status_topic: "/mission_status"
+    route_points_topic: "/mission_route_points"
+    route_points_publish_period_sec: 1.0
     cmd_vel_topic: "/cmd_vel"
     navigate_action: "/navigate_to_pose"
     ensure_nav2_active: true
@@ -16,7 +18,7 @@ mission_driver:
     # HOME 위치는 방향이 중요해서 yaw까지 직접 관리합니다.
     # 형식은 [x, y, yaw(rad)] 입니다.
     home_to_patrol_pose: [-0.265, 4.405, -1.5708]
-    home_to_dock_pose: [-0.265, 4.405, 1.5708]
+    home_to_dock_pose: [-0.265, 4.405, 1.0472]
 
     # START 명령:
     # dock -> home_to_patrol_pose -> patrol_points -> home_to_dock_pose

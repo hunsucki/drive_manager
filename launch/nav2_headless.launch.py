@@ -95,13 +95,21 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
-            DeclareLaunchArgument("namespace", default_value="", description="Top-level namespace"),
+            DeclareLaunchArgument(
+                "namespace",
+                default_value="",
+                description="Top-level namespace",
+            ),
             DeclareLaunchArgument(
                 "use_namespace",
                 default_value="false",
                 description="Whether to apply a namespace to the navigation stack",
             ),
-            DeclareLaunchArgument("slam", default_value="False", description="Whether to run SLAM"),
+            DeclareLaunchArgument(
+                "slam",
+                default_value="False",
+                description="Whether to run SLAM",
+            ),
             DeclareLaunchArgument(
                 "map",
                 default_value=default_map_file,
@@ -129,17 +137,17 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "autostart",
-                default_value="true",
+                default_value="false",
                 description="Automatically start the Nav2 stack",
             ),
             DeclareLaunchArgument(
                 "use_composition",
-                default_value="True",
+                default_value="False",
                 description="Whether to use composed Nav2 bringup",
             ),
             DeclareLaunchArgument(
                 "use_respawn",
-                default_value="False",
+                default_value="True",
                 description="Whether to respawn nodes if they crash",
             ),
             DeclareLaunchArgument("log_level", default_value="info", description="Log level"),

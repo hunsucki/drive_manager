@@ -30,11 +30,12 @@ setup(
     maintainer_email="root@example.com",
     description="Drive mission manager nodes for controlling the robot over ROS 2.",
     license="Apache License 2.0",
-    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "command_manager = drive_manager.command_manager:main",
             "mission_driver = drive_manager.mission_driver:main",
+            "nav2_supervisor = drive_manager.nav2_supervisor:main",
+            "web_teleop = drive_manager.web_teleop:main",
             "two_point = drive_manager.two_point:main",
         ],
     },

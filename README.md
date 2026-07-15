@@ -2,18 +2,23 @@
 
 헤드리스 Nav2 실행과 로봇 주행 미션 노드를 위한 ROS 2 패키지입니다.
 
-## Headless Nav2 실행
+## 통합 서버 실행
 
 ```bash
 source /root/colcon_ws/install/setup.bash
-ros2 launch drive_manager nav2_headless.launch.py
+ros2 launch drive_manager drive_manager.launch.py
 ```
 
-To inspect Nav2 from the Jetson GUI, start RViz with the same launch:
+이 명령 하나가 rosbridge, command/mission manager, `nav2_supervisor`, Nav2를 함께
+실행합니다. Nav2 프로세스는 떠 있지만 lifecycle은 `unconfigured` 상태로 대기하며,
+START/HOME 명령이 있을 때만 supervisor가 활성화합니다. 별도의
+`nav2_headless.launch.py`를 동시에 실행하면 노드가 중복되므로 실행하지 마십시오.
+
+Nav2만 수동 점검하려면 다음처럼 실행할 수 있습니다.
 
 ```bash
 source /root/colcon_ws/install/setup.bash
-ros2 launch drive_manager nav2_headless.launch.py use_rviz:=true
+ros2 launch drive_manager nav2_headless.launch.py use_rviz:=true autostart:=true
 ```
 
 이 launch 파일은 패키지 안의 URDF를 사용해 `robot_state_publisher`를 실행하고,
@@ -28,22 +33,18 @@ ros2 run drive_manager two_point
 
 ## Mobile Mission 실행
 
-`drive_manager.launch.py`는 모바일 앱 연동에 필요한 세 노드를 함께 실행합니다.
+`drive_manager.launch.py`는 모바일 앱과 주행에 필요한 프로세스를 함께 실행합니다.
 
 - `rosbridge_websocket`: 모바일 앱 WebSocket 연결용입니다. 기본 포트는 `9090`입니다.
 - `command_manager`: 앱 명령 `/robot_command`를 받아 내부 명령 `/mission_command`로 전달합니다.
 - `mission_driver`: `param/mission_config.yaml`을 읽고 Nav2 `/navigate_to_pose` 액션으로 실제 주행을 수행합니다.
+- `nav2_supervisor`: localization/navigation lifecycle을 순서대로 시작·정지·복구합니다.
+- `web_teleop`: 웹 수동 조종을 safe/force 두 경로로 중계하고 watchdog과 Nav2 상호잠금을 적용합니다.
+- `Nav2`: 기본적으로 lifecycle-inactive 상태로 대기합니다.
 
 ```bash
 source /root/colcon_ws/install/setup.bash
 ros2 launch drive_manager drive_manager.launch.py
-```
-
-실제 주행 전에는 Nav2가 먼저 실행되어 있어야 합니다.
-
-```bash
-source /root/colcon_ws/install/setup.bash
-ros2 launch drive_manager nav2_headless.launch.py
 ```
 
 ## 앱 명령
@@ -104,15 +105,384 @@ ros2 topic echo /mission_route_points
 
 발행 데이터에는 `home_to_patrol_pose`, `home_to_dock_pose`, `patrol_points`, 그리고 실제 주행 순서와 자동 계산된 patrol yaw를 담은 `navigation_sequence`가 포함됩니다.
 
+웹 지도에서 로봇 위치는 `/amcl_pose` 대신 `/robot_pose`를 구독하는 것을 권장합니다.
+주행 중에는 AMCL 위치를 전달하고, Nav2가 꺼진 도킹 상태에서는 설정된
+`docked_pose`를 transient-local로 계속 제공합니다. 위치 출처는
+`/robot_pose_status`의 `AMCL`, `DOCKED`, `DOCKED_ASSUMED`으로 구분할 수 있습니다.
+
 명령 동작:
 
-- `START`: dock 출발 escape 후, home_to_patrol_pose로 이동하고, patrol_points를 순회한 뒤 home_to_dock_pose로 돌아와 SSH 도킹 명령을 실행합니다.
+- `START`: Nav2가 비활성인 상태로 dock escape를 실행하고, `departure_initial_pose`로 AMCL을 초기화한 뒤 patrol_points를 순회합니다. 복귀·도킹 성공 후 Nav2를 다시 reset합니다.
 - `HOME`: 어디에 있든 현재 미션을 중단하고 home_to_dock_pose로 이동한 뒤 SSH 도킹 명령을 실행합니다.
 - `STOP`: 현재 Nav2 goal 또는 도킹 SSH 프로세스를 중단하고 `/cmd_vel` 0을 발행합니다.
 - `ESTOP`: STOP과 같지만 latch 상태가 되어 `RESET` 전까지 START/HOME을 거부합니다.
 - `RESET`: ESTOP latch를 해제합니다.
 
 START 중 START를 다시 누르면 `mission_driver`가 `BUSY` 상태를 발행하고 기존 미션을 계속 진행합니다. START 중 HOME을 누르면 현재 goal을 취소하고 HOME 복귀 미션으로 전환합니다.
+
+## 웹 앱 연동 가이드
+
+웹 앱은 `ws://<서버 IP>:9090`의 rosbridge WebSocket에 연결합니다. 이번 변경으로
+기존 `/robot_command`와 지도 표시 외에 다음 기능을 구현해야 합니다.
+
+1. safe/force 수동 조종 publisher 두 개
+2. 수동 조종 서버 상태 subscriber 두 개
+3. 버튼을 누르는 동안만 동작하는 10~20 Hz 송신 루프
+4. 수동 이동 후 `/initialpose`를 발행하는 2D Pose Estimate
+5. `/web_teleop/active=false`를 확인한 뒤 HOME을 보내는 복구 흐름
+
+### 웹 앱이 사용하는 ROS 인터페이스
+
+| 방향 | 토픽 | 타입 | 웹 앱에서의 역할 |
+| --- | --- | --- | --- |
+| Web → ROS | `/robot_command` | `std_msgs/msg/String` | `START`, `HOME`, `STOP`, `ESTOP`, `RESET` |
+| Web → ROS | `/cmd_vel_web_safe` | `geometry_msgs/msg/Twist` | 충돌 보호를 사용하는 기본 수동 조종 |
+| Web → ROS | `/cmd_vel_web_force` | `geometry_msgs/msg/Twist` | 충돌 보호를 우회하는 저속 탈출 조종 |
+| Web → ROS | `/initialpose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | AMCL 위치 재설정 |
+| ROS → Web | `/web_teleop/status` | `std_msgs/msg/String` | 수동 조종 전환 및 오류 상태 |
+| ROS → Web | `/web_teleop/active` | `std_msgs/msg/Bool` | 수동 조종/전환 중인지 판정 |
+| ROS → Web | `/robot_status` | `std_msgs/msg/String` | 미션 상태 및 명령 결과 |
+| ROS → Web | `/robot_pose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | 지도에 표시할 현재 위치 |
+| ROS → Web | `/robot_pose_status` | `std_msgs/msg/String` | 위치 출처: `AMCL`, `DOCKED`, `DOCKED_ASSUMED` |
+| ROS → Web | `/mission_route_points` | `std_msgs/msg/String` | HOME/순회 좌표와 주행 순서 JSON |
+
+지도에는 `/amcl_pose` 대신 `/robot_pose`를 표시해야 합니다. `/robot_pose`는 주행
+중에는 AMCL 위치를 전달하고, Nav2가 reset된 도킹 상태에서는 설정된 `docked_pose`를
+transient-local 메시지로 제공합니다.
+
+### safe와 force의 차이
+
+| 입력 토픽 | 서버 속도 제한 | 실제 출력 경로 | 사용 조건 |
+| --- | --- | --- | --- |
+| `/cmd_vel_web_safe` | 0.15 m/s, 0.40 rad/s | `/cmd_vel_nav` → velocity smoother → collision monitor → `/cmd_vel` | 모든 일반 수동 조종에서 먼저 사용 |
+| `/cmd_vel_web_force` | 0.08 m/s, 0.25 rad/s | Nav2 goal 취소 → navigation PAUSE 확인 → `/cmd_vel` | safe가 collision monitor에 막혔을 때만 사용 |
+
+`safe`는 기존 collision monitor를 통과하므로 장애물이나 잘못 남은 costmap 때문에
+움직이지 않을 수 있습니다. `force`는 이 보호를 의도적으로 우회합니다. 서버가
+navigation lifecycle의 PAUSE를 확인하지 못하면 force 속도를 출력하지 않습니다.
+
+force UI는 일반 모드 토글이 아니라 누르고 있는 동안만 켜지는 별도 위험 버튼으로
+구현하는 것을 권장합니다. 카메라 화면이 보이는 상태에서만 활성화하고, 사람·계단·
+낙하 위험이 있는 장소에서는 사용하지 마십시오.
+
+서버에는 다음 우선순위와 제한이 적용됩니다.
+
+- safe와 force가 동시에 최신이면 force가 우선합니다.
+- `linear.x`와 `angular.z`만 사용하며 나머지 축은 서버가 0으로 만듭니다.
+- `linear.x > 0`은 전진, `< 0`은 후진입니다.
+- `angular.z > 0`은 좌회전, `< 0`은 우회전입니다.
+- NaN, Infinity와 제한을 넘는 값은 서버에서 차단하거나 clamp합니다.
+- 마지막 명령 이후 0.35초가 지나면 서버가 0 속도를 발행하고 `DISABLED`가 됩니다.
+
+### rosbridge 연결 및 구독
+
+연결 직후 필요한 토픽을 advertise/subscribe합니다. 연결이 끊겼다가 다시 연결되면
+동일한 초기화를 다시 수행해야 합니다.
+
+```javascript
+// 웹 앱과 drive_manager가 같은 호스트라면 그대로 사용할 수 있습니다.
+// 호스트가 다르면 배포 설정의 drive_manager IP로 교체합니다.
+const ROSBRIDGE_URL = `ws://${window.location.hostname}:9090`;
+const ros = new WebSocket(ROSBRIDGE_URL);
+
+function sendRos(message) {
+  if (ros.readyState === WebSocket.OPEN) {
+    ros.send(JSON.stringify(message));
+  }
+}
+
+ros.addEventListener("open", () => {
+  for (const publisher of [
+    {topic: "/cmd_vel_web_safe", type: "geometry_msgs/msg/Twist"},
+    {topic: "/cmd_vel_web_force", type: "geometry_msgs/msg/Twist"},
+    {topic: "/robot_command", type: "std_msgs/msg/String"},
+    {
+      topic: "/initialpose",
+      type: "geometry_msgs/msg/PoseWithCovarianceStamped",
+    },
+  ]) {
+    sendRos({
+      op: "advertise",
+      topic: publisher.topic,
+      type: publisher.type,
+    });
+  }
+
+  for (const topic of [
+    "/web_teleop/status",
+    "/web_teleop/active",
+    "/robot_status",
+    "/robot_pose",
+    "/robot_pose_status",
+    "/mission_route_points",
+  ]) {
+    sendRos({op: "subscribe", topic, throttle_rate: 100});
+  }
+});
+```
+
+실제 서버 주소는 배포 환경에 맞게 바꿉니다. TLS를 적용한 웹 페이지에서는 브라우저의
+mixed-content 정책 때문에 `ws://`가 차단될 수 있으므로 reverse proxy를 통한
+`wss://` 구성이 필요할 수 있습니다.
+
+### 수동 조종 송신 루프
+
+Twist를 한 번만 보내는 방식으로 구현하면 안 됩니다. 사용자가 버튼이나 조이스틱을
+누르는 동안 10~20 Hz로 계속 보내야 하며, `pointerup`, `pointercancel`, 창 focus
+상실과 WebSocket 종료 시 즉시 로컬 송신 루프를 중단해야 합니다.
+
+```javascript
+const TELEOP_PERIOD_MS = 1000 / 15;
+const ZERO_TWIST = {
+  linear: {x: 0.0, y: 0.0, z: 0.0},
+  angular: {x: 0.0, y: 0.0, z: 0.0},
+};
+
+let teleopTimer = null;
+let requestedMode = null;
+let latestTwist = ZERO_TWIST;
+
+function teleopTopic(mode) {
+  return mode === "force"
+    ? "/cmd_vel_web_force"
+    : "/cmd_vel_web_safe";
+}
+
+function publishTwist(mode, twist) {
+  sendRos({
+    op: "publish",
+    topic: teleopTopic(mode),
+    msg: twist,
+  });
+}
+
+function stopTeleop() {
+  if (teleopTimer !== null) {
+    clearInterval(teleopTimer);
+    teleopTimer = null;
+  }
+
+  if (requestedMode !== null) {
+    // 즉시 정지를 돕는 0 명령입니다. 서버 watchdog도 독립적으로 동작합니다.
+    publishTwist(requestedMode, ZERO_TWIST);
+  }
+
+  requestedMode = null;
+  latestTwist = ZERO_TWIST;
+}
+
+function startTeleop(mode, linearX, angularZ) {
+  stopTeleop();
+  requestedMode = mode;
+  latestTwist = {
+    linear: {x: linearX, y: 0.0, z: 0.0},
+    angular: {x: 0.0, y: 0.0, z: angularZ},
+  };
+
+  publishTwist(requestedMode, latestTwist);
+  teleopTimer = setInterval(() => {
+    publishTwist(requestedMode, latestTwist);
+  }, TELEOP_PERIOD_MS);
+}
+
+window.addEventListener("blur", stopTeleop);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopTeleop();
+});
+ros.addEventListener("close", stopTeleop);
+```
+
+방향 버튼 연결 예시는 다음과 같습니다.
+
+```javascript
+forwardButton.addEventListener("pointerdown", () => {
+  startTeleop("safe", 0.10, 0.0);
+});
+leftButton.addEventListener("pointerdown", () => {
+  startTeleop("safe", 0.0, 0.25);
+});
+forceBackwardButton.addEventListener("pointerdown", () => {
+  startTeleop("force", -0.05, 0.0);
+});
+
+for (const button of [forwardButton, leftButton, forceBackwardButton]) {
+  button.addEventListener("pointerup", stopTeleop);
+  button.addEventListener("pointercancel", stopTeleop);
+  button.addEventListener("pointerleave", stopTeleop);
+}
+```
+
+아날로그 조이스틱을 사용한다면 정규화된 입력 `[-1, 1]`에 웹 측 최대 속도를 곱해
+`latestTwist`를 갱신합니다. 서버에도 최종 속도 제한이 있으므로 웹 제한을 잘못
+설정하더라도 설정값 이상의 속도는 출력되지 않습니다.
+
+### 상태 처리와 UI 규칙
+
+rosbridge의 수신 메시지에서 `op === "publish"`와 `topic`을 확인해 상태를 저장합니다.
+
+```javascript
+let teleopStatus = "DISABLED";
+let teleopActive = null; // 상태를 처음 받을 때까지 unknown
+startButton.disabled = true;
+homeButton.disabled = true;
+
+ros.addEventListener("message", (event) => {
+  const packet = JSON.parse(event.data);
+  if (packet.op !== "publish") return;
+
+  if (packet.topic === "/web_teleop/status") {
+    teleopStatus = packet.msg.data;
+    renderTeleopStatus(teleopStatus);
+
+    if (teleopStatus.startsWith("ERROR")) {
+      stopTeleop();
+      showError(teleopStatus);
+    }
+  }
+
+  if (packet.topic === "/web_teleop/active") {
+    teleopActive = packet.msg.data;
+    startButton.disabled = teleopActive;
+    homeButton.disabled = teleopActive;
+  }
+});
+```
+
+상태의 의미는 다음과 같습니다.
+
+| `/web_teleop/status` | UI 처리 |
+| --- | --- |
+| `DISABLED` | 수동 조종 해제. START/HOME을 허용할 수 있음 |
+| `TRANSITIONING_SAFE` | localization/navigation 시작 및 goal 취소 중. 아직 움직임을 보장하지 않음 |
+| `SAFE` | safe 속도 전달 가능 |
+| `TRANSITIONING_FORCE` | goal 취소 및 navigation PAUSE 중. 아직 force 출력 안 됨 |
+| `FORCE` | 저속 force 출력 가능. 화면에 위험 상태를 명확히 표시 |
+| `ERROR ...` | 송신 중단, 원인 표시. 자동으로 force를 재시도하지 않음 |
+
+START/HOME 버튼은 `/web_teleop/active=true`인 동안 비활성화해야 합니다. 조이스틱에서
+손을 뗀 직후에는 0 명령도 최신 수동 입력으로 간주되므로, 약 0.35초 뒤 서버에서
+`active=false`가 온 것을 확인한 다음 HOME을 발행합니다.
+
+```javascript
+function publishRobotCommand(command) {
+  if (
+    (command === "START" || command === "HOME") &&
+    teleopActive !== false
+  ) {
+    showError("수동 조종을 먼저 해제하세요.");
+    return;
+  }
+
+  sendRos({
+    op: "publish",
+    topic: "/robot_command",
+    msg: {data: command},
+  });
+}
+```
+
+서버도 같은 상호잠금을 적용하므로 active 상태에서 들어온 START/HOME은
+`MANUAL_CONTROL_ACTIVE`로 거부됩니다.
+
+### 2D Pose Estimate 구현
+
+로봇을 수동으로 크게 이동했거나 지도상의 로봇 마커가 실제 위치와 다를 때만
+`/initialpose`를 발행합니다. 수동 이동이 끝나기 전에 보내면 바로 위치가 다시
+어긋날 수 있으므로 반드시 다음 순서를 지킵니다.
+
+```text
+safe 또는 force 수동 이동
+-> 모든 방향 버튼 해제
+-> /web_teleop/active=false 확인
+-> 지도에서 실제 위치와 전방 방향 선택
+-> /initialpose 발행
+-> 새로운 /robot_pose 수신 및 위치 확인
+-> HOME 명령
+```
+
+지도에서 받은 `(x, y, yaw)`를 다음처럼 발행합니다. yaw 단위는 degree가 아니라
+radian이며, 지도 좌표계 기준 회전입니다.
+
+```javascript
+function publishInitialPose(x, y, yaw) {
+  if (teleopActive) {
+    showError("로봇을 정지한 뒤 위치를 설정하세요.");
+    return;
+  }
+
+  const nowMs = Date.now();
+  const covariance = Array(36).fill(0.0);
+  covariance[0] = 0.25 * 0.25;                  // x variance
+  covariance[7] = 0.25 * 0.25;                  // y variance
+  covariance[35] = 0.2618 * 0.2618;             // yaw variance (15 deg)
+
+  sendRos({
+    op: "publish",
+    topic: "/initialpose",
+    msg: {
+      header: {
+        stamp: {
+          sec: Math.floor(nowMs / 1000),
+          nanosec: (nowMs % 1000) * 1000000,
+        },
+        frame_id: "map",
+      },
+      pose: {
+        pose: {
+          position: {x, y, z: 0.0},
+          orientation: {
+            x: 0.0,
+            y: 0.0,
+            z: Math.sin(yaw / 2.0),
+            w: Math.cos(yaw / 2.0),
+          },
+        },
+        covariance,
+      },
+    },
+  });
+}
+```
+
+발행 직후 HOME을 자동 실행하지 말고, 발행 이후의 새로운 `/robot_pose`가 도착하고
+지도 마커와 방향이 맞는지 운영자가 확인하도록 해야 합니다. HOME 처리 과정에서
+navigation을 다시 활성화하고 costmap을 clear합니다.
+
+도킹 완료 후 `/robot_pose_status`가 `DOCKED` 또는 `DOCKED_ASSUMED`인 상태에서는
+localization이 reset되어 있으므로 `/initialpose`만 발행해도 AMCL이 처리하지 않습니다.
+이때는 고정 `docked_pose`를 지도에 표시하고 다음 START가 자동 초기화하도록 둡니다.
+
+### 수동 복구 시나리오
+
+순회 중 로봇이 장애물 영역이나 잘못된 costmap 때문에 멈춘 경우의 권장 흐름입니다.
+
+```text
+1. 카메라 스트림 확인
+2. /cmd_vel_web_safe로 먼저 탈출 시도
+3. safe가 collision monitor에 막힐 때만 force 버튼을 누른 채 저속 이동
+4. 안전한 위치에서 모든 수동 입력 해제
+5. /web_teleop/active=false 확인
+6. 실제 위치와 지도 위치가 다르면 2D Pose Estimate
+7. 새로운 /robot_pose와 방향 확인
+8. HOME을 눌러 도킹 스테이션으로 복귀
+```
+
+수동 모드에 진입하면 진행 중이던 `NavigateToPose` goal이 취소되고 기존 START 미션은
+실패로 종료됩니다. 현재 `START`는 도킹 위치에서 출발하는 전용 시퀀스이므로 중간
+위치에서 다시 누르면 안 됩니다. 수동 복구 뒤 HOME 복귀는 지원하지만, 중단된
+waypoint부터 순회를 계속하려면 별도의 `RESUME` 명령과 진행상태 저장 기능이 필요합니다.
+
+### 웹 앱 구현 체크리스트
+
+- rosbridge 재연결 시 publisher advertise와 subscriber 등록을 다시 수행한다.
+- safe를 기본값으로 사용하고 force는 누르고 있는 동안만 활성화한다.
+- Twist를 10~20 Hz로 보내고 브라우저 blur/숨김/연결 종료 때 송신을 중단한다.
+- `TRANSITIONING_*` 상태에서는 아직 로봇이 움직인다고 가정하지 않는다.
+- `ERROR`를 받으면 송신 루프를 중단하고 사용자에게 원인을 표시한다.
+- `/web_teleop/active=true`일 때 START/HOME 버튼을 비활성화한다.
+- `/robot_pose`와 `/robot_pose_status`를 지도 위치의 단일 입력으로 사용한다.
+- `/initialpose`는 로봇 정지와 `active=false`를 확인한 뒤에만 발행한다.
+- 수동 복구 뒤에는 START가 아니라 HOME을 사용한다.
 
 ## Mission 설정
 
@@ -135,6 +505,10 @@ mission_driver:
 
     home_to_patrol_pose: [-0.265, 4.405, -1.5708]
     home_to_dock_pose: [-0.265, 4.405, 1.0472]
+    departure_initial_pose: [-0.265, 4.405, -1.5708]
+    docked_pose: [-0.265, 4.405, 1.0472]
+    navigate_to_home_to_patrol_pose: false
+    reset_nav2_after_docking: true
 
     patrol_points: ["point_1", "point_2", "point_3"]
     patrol:
@@ -150,7 +524,7 @@ mission_driver:
 
     docking_mode: "ssh"
     docking_ssh_user: "user"
-    docking_ssh_host: "192.168.0.13"
+    docking_ssh_host: "192.168.0.3"
     docking_ssh_port: 22
     docking_ssh_identity_file: "/root/.ssh/id_ed25519_drive_manager"
     docking_ssh_strict_host_key_checking: "accept-new"
@@ -165,14 +539,26 @@ mission_driver:
 START 미션 순서는 항상 아래와 같습니다.
 
 ```text
+WAIT_ROBOT (/odom, /scan, TF 최신 상태 확인)
+-> Nav2 navigation inactive
 START_ESCAPE
--> HOME_TO_PATROL
+-> localization STARTUP
+-> departure_initial_pose 발행
+-> AMCL 공분산 및 map → base_link TF 확인
+-> navigation STARTUP 및 costmap clear
 -> patrol_points 순서대로 순회
 -> HOME_TO_DOCK
+-> navigation PAUSE
 -> SSH docking command
+-> 도킹 성공(exit code 0)
+-> localization/navigation RESET
+-> /robot_pose에 docked_pose 유지
 ```
 
-`start_escape_*`는 도킹스테이션에서 바로 Nav2를 시작할 때 collision_monitor가 막는 상황을 피하기 위한 짧은 탈출 동작입니다. 현재 설정은 `/cmd_vel`로 0.1 m/s 전진을 2초 수행한 뒤 Nav2 주행을 시작합니다.
+`start_escape_*`는 도킹스테이션에서 빠져나오기 위한 open-loop 동작입니다. 현재
+설정은 `/cmd_vel`로 0.1 m/s 전진을 2초 수행합니다. 그 직후의 실제 지도 좌표와
+전방 방향을 측정해 `departure_initial_pose`를 보정해야 합니다. 도킹 최종 체결
+위치도 `home_to_dock_pose`와 다를 수 있으므로 `docked_pose`를 별도로 보정하십시오.
 
 ## SSH 도킹
 
@@ -184,16 +570,20 @@ source /home/user/colcon_ws/install/setup.bash
 ros2 run docking dock_turn_backup
 ```
 
+원격 명령이 exit code `0`으로 종료되는 것을 도킹 성공 신호로 사용합니다. 도킹
+성공 후에도 노드가 계속 실행되는 형태라면, 도킹 노드가 성공 시 정상 종료하도록
+바꾸거나 별도의 성공 토픽/서비스 연동을 추가해야 합니다.
+
 SSH 접속 확인:
 
 ```bash
-ssh -i /root/.ssh/id_ed25519_drive_manager user@192.168.0.13
+ssh -i /root/.ssh/id_ed25519_drive_manager user@192.168.0.3
 ```
 
 도킹 실행 파일 확인:
 
 ```bash
-ssh -i /root/.ssh/id_ed25519_drive_manager user@192.168.0.13 \
+ssh -i /root/.ssh/id_ed25519_drive_manager user@192.168.0.3 \
   "bash -lc 'source /opt/ros/jazzy/setup.bash && source /home/user/colcon_ws/install/setup.bash && ros2 pkg executables docking | grep dock_turn_backup'"
 ```
 

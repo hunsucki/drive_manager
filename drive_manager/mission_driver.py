@@ -2,24 +2,35 @@
 
 import json
 import math
+import os
 import queue
 import shlex
+import signal
 import subprocess
 import threading
 import time
 
-import rclpy
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseStamped, Twist
-from lifecycle_msgs.msg import Transition
-from lifecycle_msgs.srv import ChangeState, GetState
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import NavigateToPose
-from nav2_msgs.srv import ManageLifecycleNodes
+from nav2_msgs.srv import ClearEntireCostmap
+from nav_msgs.msg import Odometry
+import rclpy
 from rclpy.action import ActionClient
+from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile
-from std_msgs.msg import String
+from rclpy.qos import (
+    DurabilityPolicy,
+    qos_profile_sensor_data,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+from rclpy.time import Time
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger
+from tf2_ros import Buffer, TransformException, TransformListener
 
 
 def calc_yaw_from_to(x_from, y_from, x_to, y_to):
@@ -48,6 +59,38 @@ class MissionDriver(Node):
         self.declare_parameter_if_missing("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter_if_missing("navigate_action", "/navigate_to_pose")
         self.declare_parameter_if_missing("ensure_nav2_active", True)
+        self.declare_parameter_if_missing("odom_topic", "/odom")
+        self.declare_parameter_if_missing("scan_topic", "/scan")
+        self.declare_parameter_if_missing("amcl_pose_topic", "/amcl_pose")
+        self.declare_parameter_if_missing("initial_pose_topic", "/initialpose")
+        self.declare_parameter_if_missing("robot_pose_topic", "/robot_pose")
+        self.declare_parameter_if_missing("robot_pose_status_topic", "/robot_pose_status")
+        self.declare_parameter_if_missing("web_teleop_active_topic", "/web_teleop/active")
+        self.declare_parameter_if_missing("odom_frame", "odom")
+        self.declare_parameter_if_missing("base_frame", "base_link")
+        self.declare_parameter_if_missing("map_frame", "map")
+        self.declare_parameter_if_missing("robot_message_timeout_sec", 2.0)
+        self.declare_parameter_if_missing("robot_ready_timeout_sec", 30.0)
+        self.declare_parameter_if_missing("localization_timeout_sec", 20.0)
+        self.declare_parameter_if_missing("initial_pose_publish_period_sec", 0.5)
+        self.declare_parameter_if_missing("initial_pose_xy_stddev", 0.25)
+        self.declare_parameter_if_missing("initial_pose_yaw_stddev", 0.2618)
+        self.declare_parameter_if_missing("amcl_max_xy_covariance", 0.5)
+        self.declare_parameter_if_missing("amcl_max_yaw_covariance", 0.5)
+        self.declare_parameter_if_missing("amcl_stable_samples", 3)
+        self.declare_parameter_if_missing("assume_docked_on_start", True)
+        self.declare_parameter_if_missing("reset_nav2_after_docking", True)
+        self.declare_parameter_if_missing("reset_nav2_on_robot_loss", True)
+        self.declare_parameter_if_missing("navigate_to_home_to_patrol_pose", False)
+
+        self.declare_parameter_if_missing(
+            "departure_initial_pose",
+            [-0.215, -0.045, 0.0],
+        )
+        self.declare_parameter_if_missing(
+            "docked_pose",
+            [-0.215, -0.045, math.pi],
+        )
 
         self.declare_parameter_if_missing("home_to_patrol_pose", [-0.215, -0.045, 0.0])
         self.declare_parameter_if_missing(
@@ -82,6 +125,8 @@ class MissionDriver(Node):
         )
         self.declare_parameter_if_missing("docking_timeout_sec", 120.0)
         self.declare_parameter_if_missing("docking_stop_grace_sec", 3.0)
+        self.declare_parameter_if_missing("supervisor_service_timeout_sec", 30.0)
+        self.declare_parameter_if_missing("costmap_service_timeout_sec", 5.0)
 
         self.status_pub = self.create_publisher(
             String,
@@ -92,6 +137,26 @@ class MissionDriver(Node):
             String,
             self.get_parameter("route_points_topic").value,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        pose_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.robot_pose_pub = self.create_publisher(
+            PoseWithCovarianceStamped,
+            self.get_parameter("robot_pose_topic").value,
+            pose_qos,
+        )
+        self.robot_pose_status_pub = self.create_publisher(
+            String,
+            self.get_parameter("robot_pose_status_topic").value,
+            pose_qos,
+        )
+        self.initial_pose_pub = self.create_publisher(
+            PoseWithCovarianceStamped,
+            self.get_parameter("initial_pose_topic").value,
+            10,
         )
         self.cmd_vel_pub = self.create_publisher(
             Twist,
@@ -104,16 +169,76 @@ class MissionDriver(Node):
             self.command_callback,
             10,
         )
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            self.get_parameter("odom_topic").value,
+            self.odom_callback,
+            qos_profile_sensor_data,
+        )
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            self.get_parameter("scan_topic").value,
+            self.scan_callback,
+            qos_profile_sensor_data,
+        )
+        self.amcl_pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped,
+            self.get_parameter("amcl_pose_topic").value,
+            self.amcl_pose_callback,
+            10,
+        )
+        self.web_teleop_active_sub = self.create_subscription(
+            Bool,
+            self.get_parameter("web_teleop_active_topic").value,
+            self.web_teleop_active_callback,
+            QoSProfile(
+                depth=1,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=ReliabilityPolicy.RELIABLE,
+            ),
+        )
 
         self.nav_client = ActionClient(
             self,
             NavigateToPose,
             self.get_parameter("navigate_action").value,
         )
+        self.supervisor_clients = {
+            "start_localization": self.create_client(
+                Trigger,
+                "/nav2_supervisor/start_localization",
+            ),
+            "start_navigation": self.create_client(
+                Trigger,
+                "/nav2_supervisor/start_navigation",
+            ),
+            "pause_navigation": self.create_client(
+                Trigger,
+                "/nav2_supervisor/pause_navigation",
+            ),
+            "reset_all": self.create_client(
+                Trigger,
+                "/nav2_supervisor/reset_all",
+            ),
+        }
+        self.costmap_clients = [
+            self.create_client(
+                ClearEntireCostmap,
+                "/local_costmap/clear_entirely_local_costmap",
+            ),
+            self.create_client(
+                ClearEntireCostmap,
+                "/global_costmap/clear_entirely_global_costmap",
+            ),
+        ]
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.command_queue = queue.Queue()
         self.shutdown_event = threading.Event()
         self.state_lock = threading.Lock()
+        self.sensor_lock = threading.Lock()
         self.active_goal_handle = None
         self.active_goal_label = None
         self.mission_active = False
@@ -121,8 +246,20 @@ class MissionDriver(Node):
         self.estop_latched = False
         self.zero_until_time = 0.0
         self.last_feedback_time = 0.0
+        self.last_odom_received = None
+        self.last_scan_received = None
+        self.last_scan_frame = None
+        self.last_amcl_received = None
+        self.last_amcl_pose = None
+        self.amcl_sequence = 0
+        self.pose_mode = "UNKNOWN"
+        self.nav2_expected_active = False
+        self.robot_was_ready = False
+        self.robot_loss_handling = False
+        self.web_teleop_active = False
 
         self.zero_timer = self.create_timer(0.1, self.zero_timer_callback)
+        self.robot_health_timer = self.create_timer(0.5, self.robot_health_callback)
         route_points_period_sec = max(
             0.1,
             float(self.get_parameter("route_points_publish_period_sec").value),
@@ -135,7 +272,11 @@ class MissionDriver(Node):
         self.worker.start()
 
         self.publish_route_points()
-        self.publish_status("IDLE")
+        if bool(self.get_parameter("assume_docked_on_start").value):
+            docked_pose = self.get_pose3_parameter("docked_pose")
+            if docked_pose is not None:
+                self.publish_fixed_robot_pose(docked_pose, "DOCKED_ASSUMED")
+        self.publish_status("IDLE_NAV2_INACTIVE")
         self.get_logger().info(
             f"Mission driver ready on {self.get_parameter('mission_command_topic').value}"
         )
@@ -144,11 +285,36 @@ class MissionDriver(Node):
         if not self.has_parameter(name):
             self.declare_parameter(name, default_value)
 
+    def odom_callback(self, msg):
+        del msg
+        with self.sensor_lock:
+            self.last_odom_received = time.monotonic()
+
+    def scan_callback(self, msg):
+        with self.sensor_lock:
+            self.last_scan_received = time.monotonic()
+            self.last_scan_frame = msg.header.frame_id
+
+    def amcl_pose_callback(self, msg):
+        with self.sensor_lock:
+            self.last_amcl_received = time.monotonic()
+            self.last_amcl_pose = msg
+            self.amcl_sequence += 1
+            pose_mode = self.pose_mode
+
+        if pose_mode != "DOCKED":
+            self.robot_pose_pub.publish(msg)
+            self.publish_robot_pose_status("AMCL")
+
+    def web_teleop_active_callback(self, msg):
+        self.web_teleop_active = bool(msg.data)
+
     def command_callback(self, msg):
         command = msg.data.strip().upper()
 
         if command == "RESET":
             self.estop_latched = False
+            self.consume_interrupt_reason()
             self.publish_status("IDLE")
             self.get_logger().info("ESTOP latch reset")
             return
@@ -174,10 +340,20 @@ class MissionDriver(Node):
             self.get_logger().warn(f"Ignoring {command}; RESET is required")
             return
 
+        if self.web_teleop_active:
+            self.publish_status("MANUAL_CONTROL_ACTIVE")
+            self.get_logger().warn(
+                f"Ignoring {command}; release web teleop controls first"
+            )
+            return
+
         if command == "START" and self.is_mission_active():
             self.publish_status("BUSY")
             self.get_logger().warn("Ignoring START while a mission is active")
             return
+
+        if command == "START" and not self.is_mission_active():
+            self.consume_interrupt_reason()
 
         if command == "HOME" and self.is_mission_active():
             self.clear_pending_commands()
@@ -210,29 +386,48 @@ class MissionDriver(Node):
 
     def handle_start(self):
         self.publish_status("START_MISSION")
-        if not self.prepare_navigation():
-            self.publish_status("ERROR nav2_not_ready")
-            return
-
         home_to_patrol_pose = self.get_pose3_parameter("home_to_patrol_pose")
         home_to_dock_pose = self.get_pose3_parameter("home_to_dock_pose")
+        departure_initial_pose = self.get_pose3_parameter("departure_initial_pose")
         patrol_points = self.get_patrol_points()
         if (
             home_to_patrol_pose is None
             or home_to_dock_pose is None
+            or departure_initial_pose is None
             or patrol_points is None
         ):
             self.publish_status("ERROR invalid_start_mission")
+            return
+
+        if not self.wait_for_robot_ready():
+            self.publish_status("ERROR robot_not_ready")
+            return
+
+        # Nav2 must not publish velocity while the open-loop dock escape runs.
+        if not self.pause_navigation():
+            self.publish_status("ERROR nav2_pause_failed")
             return
 
         if not self.run_start_escape():
             self.publish_command_result("START", False)
             return
 
+        if not self.prepare_navigation(
+            initial_pose=departure_initial_pose,
+            force_relocalize=True,
+        ):
+            self.publish_status("ERROR nav2_not_ready")
+            return
+
         self.log_start_mission(home_to_patrol_pose, patrol_points, home_to_dock_pose)
 
-        if not self.navigate_or_abort("START", "HOME_TO_PATROL", *home_to_patrol_pose):
-            return
+        if bool(self.get_parameter("navigate_to_home_to_patrol_pose").value):
+            if not self.navigate_or_abort(
+                "START",
+                "HOME_TO_PATROL",
+                *home_to_patrol_pose,
+            ):
+                return
 
         home_to_dock_xy = (home_to_dock_pose[0], home_to_dock_pose[1])
         for index, (name, x, y) in enumerate(patrol_points):
@@ -249,14 +444,29 @@ class MissionDriver(Node):
         if not self.navigate_or_abort("START", "HOME_TO_DOCK", *home_to_dock_pose):
             return
 
+        if not self.pause_navigation():
+            self.publish_status("ERROR nav2_pause_before_docking_failed")
+            return
+
         if not self.run_docking_step("START"):
             self.publish_command_result("START", False)
             return
 
+        self.finalize_docked_state()
         self.publish_command_result("START", True)
 
     def handle_home(self):
         self.publish_status("RETURNING_HOME")
+        with self.sensor_lock:
+            already_docked = self.pose_mode == "DOCKED" and not self.nav2_expected_active
+        if already_docked:
+            self.publish_command_result("HOME", True)
+            return
+
+        if not self.wait_for_robot_ready():
+            self.publish_status("ERROR robot_not_ready")
+            return
+
         if not self.prepare_navigation():
             self.publish_status("ERROR nav2_not_ready")
             return
@@ -269,7 +479,14 @@ class MissionDriver(Node):
         if not self.navigate_or_abort("HOME", "HOME_TO_DOCK", *home_to_dock_pose):
             return
 
-        self.publish_command_result("HOME", self.run_docking_step("HOME"))
+        if not self.pause_navigation():
+            self.publish_status("ERROR nav2_pause_before_docking_failed")
+            return
+
+        docking_ok = self.run_docking_step("HOME")
+        if docking_ok:
+            self.finalize_docked_state()
+        self.publish_command_result("HOME", docking_ok)
 
     def navigate_or_abort(self, command, label, x, y, yaw):
         if self.has_interrupt_reason():
@@ -376,8 +593,12 @@ class MissionDriver(Node):
             return None
 
     def log_start_mission(self, home_to_patrol_pose, patrol_points, home_to_dock_pose):
+        include_home_to_patrol = bool(
+            self.get_parameter("navigate_to_home_to_patrol_pose").value
+        )
         self.get_logger().info(
-            "START sequence: HOME_TO_PATROL -> "
+            "START sequence: ESCAPE -> LOCALIZE -> "
+            + ("HOME_TO_PATROL -> " if include_home_to_patrol else "")
             + " -> ".join(name for name, _, _ in patrol_points)
             + " -> HOME_TO_DOCK"
         )
@@ -402,10 +623,14 @@ class MissionDriver(Node):
     def build_route_points_payload(self):
         home_to_patrol_pose = self.get_pose3_parameter("home_to_patrol_pose")
         home_to_dock_pose = self.get_pose3_parameter("home_to_dock_pose")
+        departure_initial_pose = self.get_pose3_parameter("departure_initial_pose")
+        docked_pose = self.get_pose3_parameter("docked_pose")
         patrol_points = self.get_patrol_points()
         if (
             home_to_patrol_pose is None
             or home_to_dock_pose is None
+            or departure_initial_pose is None
+            or docked_pose is None
             or patrol_points is None
         ):
             return None
@@ -414,6 +639,8 @@ class MissionDriver(Node):
             "frame_id": "map",
             "home_to_patrol_pose": self.pose3_to_dict(home_to_patrol_pose),
             "home_to_dock_pose": self.pose3_to_dict(home_to_dock_pose),
+            "departure_initial_pose": self.pose3_to_dict(departure_initial_pose),
+            "docked_pose": self.pose3_to_dict(docked_pose),
             "patrol_points": [
                 {
                     "name": name,
@@ -422,14 +649,17 @@ class MissionDriver(Node):
                 }
                 for name, x, y in patrol_points
             ],
-            "navigation_sequence": [
+            "navigation_sequence": [],
+        }
+
+        if bool(self.get_parameter("navigate_to_home_to_patrol_pose").value):
+            payload["navigation_sequence"].append(
                 {
                     "name": "HOME_TO_PATROL",
                     "type": "home",
                     **self.pose3_to_dict(home_to_patrol_pose),
                 }
-            ],
-        }
+            )
 
         home_to_dock_xy = (home_to_dock_pose[0], home_to_dock_pose[1])
         for index, (name, x, y) in enumerate(patrol_points):
@@ -570,7 +800,7 @@ class MissionDriver(Node):
         )
 
         try:
-            process = subprocess.Popen(docking_command)
+            process = subprocess.Popen(docking_command, start_new_session=True)
         except OSError as exc:
             self.get_logger().error(f"Failed to start docking command: {exc}")
             return False
@@ -609,12 +839,22 @@ class MissionDriver(Node):
         if process.poll() is not None:
             return
 
-        process.terminate()
+        self.signal_process_group(process, signal.SIGINT)
         try:
             process.wait(timeout=max(0.1, grace_sec))
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=1.0)
+            self.signal_process_group(process, signal.SIGTERM)
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.signal_process_group(process, signal.SIGKILL)
+                process.wait(timeout=1.0)
+
+    def signal_process_group(self, process, signal_number):
+        try:
+            os.killpg(process.pid, signal_number)
+        except ProcessLookupError:
+            pass
 
     def publish_command_result(self, command, ok):
         if ok:
@@ -631,10 +871,299 @@ class MissionDriver(Node):
         else:
             self.publish_status(f"FAILED {command}")
 
-    def prepare_navigation(self):
+    def prepare_navigation(self, initial_pose=None, force_relocalize=False):
         if not self.get_parameter("ensure_nav2_active").value:
             return True
-        return self.ensure_navigation_active()
+
+        if not self.robot_is_ready():
+            self.get_logger().error("Robot inputs became stale before Nav2 startup")
+            return False
+
+        if force_relocalize:
+            self.publish_status("RESETTING_NAV2")
+            if not self.reset_nav2():
+                return False
+
+        self.publish_status("STARTING_LOCALIZATION")
+        if not self.call_supervisor("start_localization"):
+            return False
+
+        with self.sensor_lock:
+            self.pose_mode = "LOCALIZING"
+
+        if force_relocalize:
+            self.publish_status("WAITING_FOR_LOCALIZATION")
+            if not self.wait_for_localization(initial_pose):
+                self.get_logger().error("AMCL did not converge after the initial pose")
+                return False
+        elif not self.wait_for_localization(None):
+            self.get_logger().error("A current AMCL pose is not available")
+            return False
+
+        self.publish_status("STARTING_NAVIGATION")
+        if not self.call_supervisor("start_navigation"):
+            return False
+
+        with self.sensor_lock:
+            self.nav2_expected_active = True
+            self.robot_was_ready = True
+
+        if not self.clear_costmaps():
+            self.get_logger().error("Nav2 started, but costmaps could not be cleared")
+            self.pause_navigation()
+            return False
+
+        self.publish_status("NAV2_READY")
+        return True
+
+    def wait_for_robot_ready(self):
+        timeout = float(self.get_parameter("robot_ready_timeout_sec").value)
+        deadline = time.monotonic() + timeout
+        self.publish_status("WAITING_FOR_ROBOT")
+
+        while not self.shutdown_event.is_set() and time.monotonic() < deadline:
+            if self.has_interrupt_reason():
+                return False
+            if self.robot_is_ready():
+                with self.sensor_lock:
+                    self.robot_was_ready = True
+                self.get_logger().info("Robot odometry, scan, and TF are ready")
+                return True
+            time.sleep(0.2)
+
+        self.get_logger().error("Timed out waiting for robot odometry, scan, and TF")
+        return False
+
+    def robot_is_ready(self):
+        timeout = float(self.get_parameter("robot_message_timeout_sec").value)
+        now = time.monotonic()
+        with self.sensor_lock:
+            odom_received = self.last_odom_received
+            scan_received = self.last_scan_received
+            scan_frame = self.last_scan_frame
+
+        if odom_received is None or now - odom_received > timeout:
+            return False
+        if scan_received is None or now - scan_received > timeout:
+            return False
+        if not self.transform_available(
+            self.get_parameter("odom_frame").value,
+            self.get_parameter("base_frame").value,
+        ):
+            return False
+        if scan_frame and not self.transform_available(
+            self.get_parameter("base_frame").value,
+            scan_frame,
+        ):
+            return False
+        return True
+
+    def transform_available(self, target_frame, source_frame):
+        try:
+            return self.tf_buffer.can_transform(
+                str(target_frame),
+                str(source_frame),
+                Time(),
+                timeout=Duration(seconds=0.05),
+            )
+        except TransformException:
+            return False
+
+    def wait_for_localization(self, initial_pose):
+        timeout = float(self.get_parameter("localization_timeout_sec").value)
+        publish_period = max(
+            0.1,
+            float(self.get_parameter("initial_pose_publish_period_sec").value),
+        )
+        required_samples = max(
+            1,
+            int(self.get_parameter("amcl_stable_samples").value),
+        )
+        deadline = time.monotonic() + timeout
+        next_publish = 0.0
+        last_sequence = -1
+        stable_samples = 0
+        started_at = time.monotonic()
+
+        while not self.shutdown_event.is_set() and time.monotonic() < deadline:
+            if self.has_interrupt_reason() or not self.robot_is_ready():
+                return False
+
+            now = time.monotonic()
+            if initial_pose is not None and now >= next_publish:
+                self.publish_initial_pose(initial_pose)
+                next_publish = now + publish_period
+
+            with self.sensor_lock:
+                amcl_pose = self.last_amcl_pose
+                amcl_received = self.last_amcl_received
+                sequence = self.amcl_sequence
+
+            is_new_sample = sequence != last_sequence
+            is_fresh = amcl_received is not None and amcl_received >= started_at
+            if is_new_sample:
+                last_sequence = sequence
+                if (
+                    is_fresh
+                    and self.amcl_covariance_is_acceptable(amcl_pose)
+                    and self.transform_available(
+                        self.get_parameter("map_frame").value,
+                        self.get_parameter("base_frame").value,
+                    )
+                ):
+                    stable_samples += 1
+                    if stable_samples >= required_samples:
+                        with self.sensor_lock:
+                            self.pose_mode = "AMCL"
+                        self.publish_robot_pose_status("AMCL")
+                        return True
+                else:
+                    stable_samples = 0
+
+            time.sleep(0.1)
+
+        return False
+
+    def publish_initial_pose(self, pose):
+        msg = self.make_pose_with_covariance(pose)
+        self.initial_pose_pub.publish(msg)
+
+    def make_pose_with_covariance(self, pose):
+        x, y, yaw = pose
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = str(self.get_parameter("map_frame").value)
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose.position.x = float(x)
+        msg.pose.pose.position.y = float(y)
+        qz, qw = yaw_to_quaternion(float(yaw))
+        msg.pose.pose.orientation.z = qz
+        msg.pose.pose.orientation.w = qw
+
+        xy_stddev = float(self.get_parameter("initial_pose_xy_stddev").value)
+        yaw_stddev = float(self.get_parameter("initial_pose_yaw_stddev").value)
+        msg.pose.covariance[0] = xy_stddev * xy_stddev
+        msg.pose.covariance[7] = xy_stddev * xy_stddev
+        msg.pose.covariance[35] = yaw_stddev * yaw_stddev
+        return msg
+
+    def amcl_covariance_is_acceptable(self, msg):
+        if msg is None:
+            return False
+        covariance = msg.pose.covariance
+        max_xy = float(self.get_parameter("amcl_max_xy_covariance").value)
+        max_yaw = float(self.get_parameter("amcl_max_yaw_covariance").value)
+        values = (covariance[0], covariance[7], covariance[35])
+        if not all(math.isfinite(value) and value >= 0.0 for value in values):
+            return False
+        return max(covariance[0], covariance[7]) <= max_xy and covariance[35] <= max_yaw
+
+    def clear_costmaps(self):
+        timeout = float(self.get_parameter("costmap_service_timeout_sec").value)
+        for client in self.costmap_clients:
+            response = self.call_service(
+                client,
+                ClearEntireCostmap.Request(),
+                timeout_sec=timeout,
+            )
+            if response is None:
+                return False
+        return True
+
+    def call_supervisor(self, operation):
+        client = self.supervisor_clients[operation]
+        timeout = float(self.get_parameter("supervisor_service_timeout_sec").value)
+        response = self.call_service(client, Trigger.Request(), timeout_sec=timeout)
+        if response is None:
+            self.get_logger().error(f"Nav2 supervisor {operation} is unavailable")
+            return False
+        if not response.success:
+            self.get_logger().error(
+                f"Nav2 supervisor {operation} failed: {response.message}"
+            )
+            return False
+        return True
+
+    def pause_navigation(self):
+        if not self.get_parameter("ensure_nav2_active").value:
+            return True
+        success = self.call_supervisor("pause_navigation")
+        if success:
+            with self.sensor_lock:
+                self.nav2_expected_active = False
+        return success
+
+    def reset_nav2(self):
+        if not self.get_parameter("ensure_nav2_active").value:
+            return True
+        success = self.call_supervisor("reset_all")
+        if success:
+            with self.sensor_lock:
+                self.nav2_expected_active = False
+        return success
+
+    def finalize_docked_state(self):
+        with self.sensor_lock:
+            self.pose_mode = "DOCKED"
+            self.nav2_expected_active = False
+
+        if bool(self.get_parameter("reset_nav2_after_docking").value):
+            if not self.reset_nav2():
+                self.get_logger().error(
+                    "Docking succeeded, but Nav2 could not be reset"
+                )
+
+        docked_pose = self.get_pose3_parameter("docked_pose")
+        if docked_pose is not None:
+            self.publish_fixed_robot_pose(docked_pose, "DOCKED")
+        self.publish_status("DOCKED_NAV2_INACTIVE")
+
+    def publish_fixed_robot_pose(self, pose, source):
+        with self.sensor_lock:
+            self.pose_mode = "DOCKED" if source.startswith("DOCKED") else source
+        self.robot_pose_pub.publish(self.make_pose_with_covariance(pose))
+        self.publish_robot_pose_status(source)
+
+    def publish_robot_pose_status(self, status):
+        msg = String()
+        msg.data = status
+        self.robot_pose_status_pub.publish(msg)
+
+    def robot_health_callback(self):
+        with self.sensor_lock:
+            nav2_expected_active = self.nav2_expected_active
+            robot_was_ready = self.robot_was_ready
+            handling = self.robot_loss_handling
+
+        if not nav2_expected_active or not robot_was_ready or handling:
+            return
+        if self.robot_is_ready():
+            return
+
+        with self.sensor_lock:
+            self.robot_loss_handling = True
+        self.set_interrupt_reason("ROBOT_LOST")
+        self.cancel_active_goal()
+        self.zero_until_time = time.time() + float(
+            self.get_parameter("stop_zero_seconds").value
+        )
+        self.publish_zero_velocity()
+        self.publish_status("ROBOT_LOST_NAV2_STOPPING")
+        threading.Thread(
+            target=self.handle_robot_loss,
+            daemon=True,
+        ).start()
+
+    def handle_robot_loss(self):
+        try:
+            if bool(self.get_parameter("reset_nav2_on_robot_loss").value):
+                self.reset_nav2()
+            else:
+                self.pause_navigation()
+        finally:
+            with self.sensor_lock:
+                self.nav2_expected_active = False
+                self.robot_loss_handling = False
+            self.publish_status("WAITING_FOR_ROBOT")
 
     def make_pose_stamped(self, x, y, yaw):
         pose = PoseStamped()
@@ -675,7 +1204,11 @@ class MissionDriver(Node):
             self.active_goal_label = label
 
         result_future = goal_handle.get_result_async()
-        result_response = self.wait_for_future(result_future, None)
+        result_response = self.wait_for_future(
+            result_future,
+            None,
+            abort_on_interrupt=True,
+        )
 
         with self.state_lock:
             if self.active_goal_handle == goal_handle:
@@ -683,7 +1216,10 @@ class MissionDriver(Node):
                 self.active_goal_label = None
 
         if result_response is None:
-            self.get_logger().error(f"{label} result unavailable")
+            if self.has_interrupt_reason():
+                self.get_logger().warn(f"{label} interrupted while waiting for result")
+            else:
+                self.get_logger().error(f"{label} result unavailable")
             return False
 
         status = result_response.status
@@ -716,8 +1252,18 @@ class MissionDriver(Node):
         stop_seconds = self.get_parameter("stop_zero_seconds").value
         self.zero_until_time = time.time() + float(stop_seconds)
         self.publish_zero_velocity()
-        self.publish_status("STOPPED" if reason == "STOP" else "ESTOP_LATCHED")
+        if reason == "STOP":
+            status = "STOPPED"
+        elif reason == "ESTOP":
+            status = "ESTOP_LATCHED"
+        else:
+            status = reason
+        self.publish_status(status)
         self.get_logger().warn(f"{reason}: active goal canceled and zero velocity sent")
+        with self.sensor_lock:
+            nav2_expected_active = self.nav2_expected_active
+        if nav2_expected_active and reason in ("STOP", "ESTOP"):
+            threading.Thread(target=self.pause_navigation, daemon=True).start()
 
     def cancel_active_goal(self):
         with self.state_lock:
@@ -788,7 +1334,7 @@ class MissionDriver(Node):
         self.status_pub.publish(msg)
         self.get_logger().info(f"Status: {status}")
 
-    def wait_for_future(self, future, timeout_sec):
+    def wait_for_future(self, future, timeout_sec, abort_on_interrupt=False):
         event = threading.Event()
         result_holder = {}
 
@@ -805,8 +1351,14 @@ class MissionDriver(Node):
             while not self.shutdown_event.is_set():
                 if event.wait(timeout=0.2):
                     break
+                if abort_on_interrupt and self.has_interrupt_reason():
+                    return None
         else:
-            event.wait(timeout=float(timeout_sec))
+            deadline = time.monotonic() + float(timeout_sec)
+            while not event.is_set() and time.monotonic() < deadline:
+                event.wait(timeout=min(0.2, max(0.0, deadline - time.monotonic())))
+                if abort_on_interrupt and self.has_interrupt_reason():
+                    return None
 
         if not event.is_set():
             return None
@@ -822,120 +1374,6 @@ class MissionDriver(Node):
 
         future = client.call_async(request)
         return self.wait_for_future(future, timeout_sec)
-
-    def get_lifecycle_state(self, node_name):
-        client = self.create_client(GetState, f"{node_name}/get_state")
-        response = self.call_service(client, GetState.Request(), timeout_sec=2.0)
-        self.destroy_client(client)
-
-        if response is None:
-            return None
-
-        return response.current_state.id
-
-    def change_lifecycle_state(self, node_name, transition_id):
-        client = self.create_client(ChangeState, f"{node_name}/change_state")
-        request = ChangeState.Request()
-        request.transition.id = transition_id
-        response = self.call_service(client, request, timeout_sec=10.0)
-        self.destroy_client(client)
-
-        return response is not None and response.success
-
-    def activate_lifecycle_node(self, node_name):
-        state = self.get_lifecycle_state(node_name)
-
-        if state == 3:
-            return True
-
-        if state == 1:
-            self.get_logger().info(f"Configuring {node_name}")
-            if not self.change_lifecycle_state(
-                node_name,
-                Transition.TRANSITION_CONFIGURE,
-            ):
-                self.get_logger().warn(f"Failed to configure {node_name}")
-                return False
-            state = self.get_lifecycle_state(node_name)
-
-        if state == 2:
-            self.get_logger().info(f"Activating {node_name}")
-            if not self.change_lifecycle_state(
-                node_name,
-                Transition.TRANSITION_ACTIVATE,
-            ):
-                self.get_logger().warn(f"Failed to activate {node_name}")
-                return False
-
-        return self.get_lifecycle_state(node_name) == 3
-
-    def ensure_navigation_active(self):
-        required_nodes = [
-            "/local_costmap/local_costmap",
-            "/global_costmap/global_costmap",
-            "/controller_server",
-            "/planner_server",
-            "/smoother_server",
-            "/bt_navigator",
-            "/behavior_server",
-            "/velocity_smoother",
-            "/collision_monitor",
-        ]
-
-        inactive_nodes = [
-            node_name
-            for node_name in required_nodes
-            if self.get_lifecycle_state(node_name) != 3
-        ]
-
-        if not inactive_nodes:
-            return True
-
-        self.get_logger().info(
-            "Starting Nav2 lifecycle nodes: " + ", ".join(inactive_nodes)
-        )
-
-        manager_client = self.create_client(
-            ManageLifecycleNodes,
-            "/lifecycle_manager_navigation/manage_nodes",
-        )
-        manager_request = ManageLifecycleNodes.Request()
-        manager_request.command = ManageLifecycleNodes.Request.STARTUP
-        manager_response = self.call_service(
-            manager_client,
-            manager_request,
-            timeout_sec=20.0,
-        )
-        self.destroy_client(manager_client)
-
-        if manager_response is not None and manager_response.success:
-            start_time = time.time()
-            while time.time() - start_time < 10.0:
-                if all(
-                    self.get_lifecycle_state(node_name) == 3
-                    for node_name in required_nodes
-                ):
-                    return True
-                time.sleep(0.2)
-
-        self.get_logger().warn(
-            "Lifecycle manager startup did not activate every node; "
-            "trying direct transitions"
-        )
-
-        failed_nodes = [
-            node_name
-            for node_name in required_nodes
-            if not self.activate_lifecycle_node(node_name)
-        ]
-
-        if failed_nodes:
-            self.get_logger().error(
-                "Nav2 lifecycle nodes are not active: " + ", ".join(failed_nodes)
-            )
-            return False
-
-        return True
 
     def destroy_node(self):
         self.shutdown_event.set()

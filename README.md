@@ -562,6 +562,10 @@ START_ESCAPE
 
 ## SSH 도킹
 
+라즈베리파이의 `docking` 패키지가 지켜야 할 종료 코드, 신호 처리, `/cmd_vel`
+소유권, DDS/SSH 제약과 통합 시험 절차는
+[원격 도킹 패키지 연동 규격](DOCKING_PACKAGE_INTEGRATION.md)을 참고하십시오.
+
 도킹 단계에서는 `mission_driver`가 라즈베리파이에 SSH로 접속해서 아래 명령을 실행합니다.
 
 ```bash

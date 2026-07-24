@@ -58,7 +58,11 @@ def generate_launch_description():
     rviz_config_file = LaunchConfiguration("rviz_config_file")
 
     default_params_file = os.path.join(drive_manager_dir, "param", "stella.yaml")
-    default_urdf_model = os.path.join(drive_manager_dir, "urdf", "stella.urdf")
+    default_urdf_model = os.path.join(
+        drive_manager_dir,
+        "urdf",
+        "stella_realsense.urdf",
+    )
     default_map_file = os.path.join(drive_manager_dir, "map", "map.yaml")
     default_rviz_config_file = os.path.join(
         drive_manager_dir,

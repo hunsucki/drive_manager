@@ -46,6 +46,9 @@ def yaw_to_quaternion(yaw):
 class MissionDriver(Node):
     """Executes navigation missions received from command_manager."""
 
+    STARTUP_LOCALIZATION_COMMAND = "__STARTUP_LOCALIZATION__"
+    MANUAL_INITIAL_POSE_COMMAND = "__MANUAL_INITIAL_POSE__"
+
     def __init__(self):
         super().__init__(
             "mission_driver",
@@ -59,6 +62,18 @@ class MissionDriver(Node):
         self.declare_parameter_if_missing("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter_if_missing("navigate_action", "/navigate_to_pose")
         self.declare_parameter_if_missing("ensure_nav2_active", True)
+        self.declare_parameter_if_missing(
+            "start_localization_on_startup",
+            True,
+        )
+        self.declare_parameter_if_missing(
+            "manual_initial_pose_starts_navigation",
+            True,
+        )
+        self.declare_parameter_if_missing(
+            "keep_localization_active_when_idle",
+            True,
+        )
         self.declare_parameter_if_missing("odom_topic", "/odom")
         self.declare_parameter_if_missing("scan_topic", "/scan")
         self.declare_parameter_if_missing("amcl_pose_topic", "/amcl_pose")
@@ -128,10 +143,15 @@ class MissionDriver(Node):
         self.declare_parameter_if_missing("supervisor_service_timeout_sec", 30.0)
         self.declare_parameter_if_missing("costmap_service_timeout_sec", 5.0)
 
+        mission_status_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
         self.status_pub = self.create_publisher(
             String,
             self.get_parameter("mission_status_topic").value,
-            10,
+            mission_status_qos,
         )
         self.route_points_pub = self.create_publisher(
             String,
@@ -185,6 +205,12 @@ class MissionDriver(Node):
             PoseWithCovarianceStamped,
             self.get_parameter("amcl_pose_topic").value,
             self.amcl_pose_callback,
+            10,
+        )
+        self.manual_initial_pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped,
+            self.get_parameter("initial_pose_topic").value,
+            self.manual_initial_pose_callback,
             10,
         )
         self.web_teleop_active_sub = self.create_subscription(
@@ -242,6 +268,7 @@ class MissionDriver(Node):
         self.active_goal_handle = None
         self.active_goal_label = None
         self.mission_active = False
+        self.manual_initial_pose_pending = False
         self.interrupt_reason = None
         self.estop_latched = False
         self.zero_until_time = 0.0
@@ -277,6 +304,11 @@ class MissionDriver(Node):
             if docked_pose is not None:
                 self.publish_fixed_robot_pose(docked_pose, "DOCKED_ASSUMED")
         self.publish_status("IDLE_NAV2_INACTIVE")
+        if (
+            bool(self.get_parameter("ensure_nav2_active").value)
+            and bool(self.get_parameter("start_localization_on_startup").value)
+        ):
+            self.command_queue.put(self.STARTUP_LOCALIZATION_COMMAND)
         self.get_logger().info(
             f"Mission driver ready on {self.get_parameter('mission_command_topic').value}"
         )
@@ -308,6 +340,32 @@ class MissionDriver(Node):
 
     def web_teleop_active_callback(self, msg):
         self.web_teleop_active = bool(msg.data)
+
+    def manual_initial_pose_callback(self, msg):
+        if not bool(
+            self.get_parameter("manual_initial_pose_starts_navigation").value
+        ):
+            return
+
+        with self.state_lock:
+            if (
+                self.mission_active
+                or self.manual_initial_pose_pending
+                or not self.command_queue.empty()
+            ):
+                self.get_logger().warn(
+                    "Ignoring manual initial pose while another operation "
+                    "is pending"
+                )
+                return
+            self.manual_initial_pose_pending = True
+
+        position = msg.pose.pose.position
+        self.get_logger().info(
+            "Queued manual initial pose: "
+            f"x={position.x:.3f}, y={position.y:.3f}"
+        )
+        self.command_queue.put(self.MANUAL_INITIAL_POSE_COMMAND)
 
     def command_callback(self, msg):
         command = msg.data.strip().upper()
@@ -347,7 +405,9 @@ class MissionDriver(Node):
             )
             return
 
-        if command == "START" and self.is_mission_active():
+        if command == "START" and (
+            self.is_mission_active() or self.is_manual_initial_pose_pending()
+        ):
             self.publish_status("BUSY")
             self.get_logger().warn("Ignoring START while a mission is active")
             return
@@ -371,18 +431,49 @@ class MissionDriver(Node):
             except queue.Empty:
                 continue
 
+            tracks_mission_state = command != self.STARTUP_LOCALIZATION_COMMAND
             try:
-                self.set_mission_active(True)
+                if tracks_mission_state:
+                    self.set_mission_active(True)
                 if command == "START":
                     self.handle_start()
                 elif command == "HOME":
                     self.handle_home()
+                elif command == self.STARTUP_LOCALIZATION_COMMAND:
+                    self.handle_startup_localization()
+                elif command == self.MANUAL_INITIAL_POSE_COMMAND:
+                    self.handle_manual_initial_pose()
             except Exception as exc:
                 self.publish_status(f"ERROR {command}")
                 self.get_logger().error(f"Failed to handle {command}: {exc}")
             finally:
-                self.set_mission_active(False)
+                if command == self.MANUAL_INITIAL_POSE_COMMAND:
+                    self.set_manual_initial_pose_pending(False)
+                if tracks_mission_state:
+                    self.set_mission_active(False)
                 self.command_queue.task_done()
+
+    def handle_startup_localization(self):
+        self.publish_status("STARTING_LOCALIZATION")
+        if not self.call_supervisor("start_localization"):
+            self.publish_status("ERROR startup_localization_failed")
+            return
+
+        with self.sensor_lock:
+            self.nav2_expected_active = False
+        self.publish_status("WAITING_FOR_INITIAL_POSE")
+
+    def handle_manual_initial_pose(self):
+        self.publish_status("MANUAL_INITIAL_POSE_RECEIVED")
+        if not self.wait_for_robot_ready():
+            self.publish_status("ERROR robot_not_ready")
+            return
+
+        if not self.prepare_navigation():
+            self.publish_status("ERROR manual_nav2_not_ready")
+            return
+
+        self.publish_status("MANUAL_NAV2_READY")
 
     def handle_start(self):
         self.publish_status("START_MISSION")
@@ -1111,6 +1202,8 @@ class MissionDriver(Node):
                 self.get_logger().error(
                     "Docking succeeded, but Nav2 could not be reset"
                 )
+            else:
+                self.restore_idle_localization("docking")
 
         docked_pose = self.get_pose3_parameter("docked_pose")
         if docked_pose is not None:
@@ -1156,7 +1249,8 @@ class MissionDriver(Node):
     def handle_robot_loss(self):
         try:
             if bool(self.get_parameter("reset_nav2_on_robot_loss").value):
-                self.reset_nav2()
+                if self.reset_nav2():
+                    self.restore_idle_localization("robot loss")
             else:
                 self.pause_navigation()
         finally:
@@ -1295,9 +1389,17 @@ class MissionDriver(Node):
         with self.state_lock:
             return self.mission_active
 
+    def is_manual_initial_pose_pending(self):
+        with self.state_lock:
+            return self.manual_initial_pose_pending
+
     def set_mission_active(self, active):
         with self.state_lock:
             self.mission_active = active
+
+    def set_manual_initial_pose_pending(self, pending):
+        with self.state_lock:
+            self.manual_initial_pose_pending = pending
 
     def set_interrupt_reason(self, reason):
         with self.state_lock:
@@ -1316,10 +1418,29 @@ class MissionDriver(Node):
     def clear_pending_commands(self):
         while True:
             try:
-                self.command_queue.get_nowait()
+                command = self.command_queue.get_nowait()
+                if command == self.MANUAL_INITIAL_POSE_COMMAND:
+                    self.set_manual_initial_pose_pending(False)
                 self.command_queue.task_done()
             except queue.Empty:
                 break
+
+    def restore_idle_localization(self, context):
+        if not bool(
+            self.get_parameter("keep_localization_active_when_idle").value
+        ):
+            return True
+        if self.call_supervisor("start_localization"):
+            self.get_logger().info(
+                f"Localization restored after {context}; "
+                "waiting for initial pose"
+            )
+            return True
+
+        self.get_logger().error(
+            f"Failed to restore localization after {context}"
+        )
+        return False
 
     def zero_timer_callback(self):
         if time.time() < self.zero_until_time:

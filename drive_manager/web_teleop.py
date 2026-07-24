@@ -26,8 +26,48 @@ def clamp_twist(command, max_linear_x, max_angular_z):
     return output
 
 
+def twist_is_zero(command):
+    """Return whether the supported differential-drive axes are both zero."""
+    return command.linear.x == 0.0 and command.angular.z == 0.0
+
+
+def mission_status_forces_safe(status):
+    """Return whether a mission status must immediately disarm web teleop."""
+    normalized = str(status).strip().upper()
+    exact_statuses = {
+        "START_MISSION",
+        "START_ESCAPE",
+        "RETURNING_HOME",
+        "RETURNING_HOME_REQUESTED",
+        "DOCKING",
+        "DOCKED_NAV2_INACTIVE",
+        "RESETTING_NAV2",
+        "STARTING_LOCALIZATION",
+        "WAITING_FOR_LOCALIZATION",
+        "STARTING_NAVIGATION",
+        "WAITING_FOR_ROBOT",
+        "ROBOT_LOST_NAV2_STOPPING",
+        "STOPPED",
+        "ESTOP_LATCHED",
+    }
+    return (
+        normalized in exact_statuses
+        or normalized.startswith("ERROR")
+        or normalized.startswith("DOCKING")
+        or normalized.startswith("ESTOP_LATCHED ")
+    )
+
+
+def mission_status_blocks_force(status):
+    """Return whether a new FORCE request is unsafe in the current mission state."""
+    normalized = str(status).strip().upper()
+    if normalized in {"STOPPED", "DOCKED_NAV2_INACTIVE"}:
+        return False
+    return mission_status_forces_safe(normalized)
+
+
 class WebTeleop(Node):
-    """Arbitrates collision-checked and low-speed recovery teleoperation."""
+    """Arbitrate safe teleoperation and an explicitly latched FORCE mode."""
 
     DISABLED = "DISABLED"
     SAFE = "SAFE"
@@ -39,14 +79,23 @@ class WebTeleop(Node):
             automatically_declare_parameters_from_overrides=True,
         )
 
+        self.declare_parameter_if_missing("mode_request_topic", "/web_teleop/mode_request")
         self.declare_parameter_if_missing("safe_input_topic", "/cmd_vel_web_safe")
         self.declare_parameter_if_missing("force_input_topic", "/cmd_vel_web_force")
         self.declare_parameter_if_missing("safe_output_topic", "/cmd_vel_nav")
         self.declare_parameter_if_missing("force_output_topic", "/cmd_vel")
         self.declare_parameter_if_missing("status_topic", "/web_teleop/status")
         self.declare_parameter_if_missing("active_topic", "/web_teleop/active")
+        self.declare_parameter_if_missing("safety_command_topic", "/robot_command")
+        self.declare_parameter_if_missing("mission_status_topic", "/mission_status")
+        self.declare_parameter_if_missing("drive_status_topic", "/robot_status")
+        self.declare_parameter_if_missing(
+            "supervisor_status_topic",
+            "/nav2_supervisor/status",
+        )
         self.declare_parameter_if_missing("command_timeout_sec", 0.35)
         self.declare_parameter_if_missing("stop_publish_duration_sec", 0.5)
+        self.declare_parameter_if_missing("state_publish_period_sec", 1.0)
         self.declare_parameter_if_missing("safe_max_linear_x", 0.15)
         self.declare_parameter_if_missing("safe_max_angular_z", 0.4)
         self.declare_parameter_if_missing("force_max_linear_x", 0.08)
@@ -78,6 +127,13 @@ class WebTeleop(Node):
             self.get_parameter("force_output_topic").value,
             10,
         )
+
+        self.mode_request_sub = self.create_subscription(
+            String,
+            self.get_parameter("mode_request_topic").value,
+            self.mode_request_callback,
+            10,
+        )
         self.safe_sub = self.create_subscription(
             Twist,
             self.get_parameter("safe_input_topic").value,
@@ -89,6 +145,30 @@ class WebTeleop(Node):
             self.get_parameter("force_input_topic").value,
             self.force_callback,
             10,
+        )
+        self.safety_command_sub = self.create_subscription(
+            String,
+            self.get_parameter("safety_command_topic").value,
+            self.safety_command_callback,
+            10,
+        )
+        self.mission_status_sub = self.create_subscription(
+            String,
+            self.get_parameter("mission_status_topic").value,
+            self.mission_status_callback,
+            state_qos,
+        )
+        self.drive_status_sub = self.create_subscription(
+            String,
+            self.get_parameter("drive_status_topic").value,
+            self.drive_status_callback,
+            10,
+        )
+        self.supervisor_status_sub = self.create_subscription(
+            String,
+            self.get_parameter("supervisor_status_topic").value,
+            self.supervisor_status_callback,
+            state_qos,
         )
 
         self.cancel_goal_client = self.create_client(
@@ -111,6 +191,8 @@ class WebTeleop(Node):
         }
 
         self.lock = threading.Lock()
+        self.transition_call_lock = threading.Lock()
+        self.state_publish_lock = threading.Lock()
         self.shutdown_event = threading.Event()
         self.latest_commands = {
             self.SAFE: (Twist(), 0.0),
@@ -118,19 +200,192 @@ class WebTeleop(Node):
         }
         self.mode = self.DISABLED
         self.transitioning = False
-        self.stop_mode = None
+        self.transition_target = None
+        self.transition_generation = 0
+        self.last_mission_status = ""
         self.stop_until = 0.0
-        self.last_status = None
+        self.current_status = None
+        self.current_active = None
+        self.last_state_publish_time = 0.0
 
         self.timer = self.create_timer(0.05, self.timer_callback)
-        self.publish_state(self.DISABLED, active=False)
+        self.publish_zero(self.SAFE)
+        self.publish_zero(self.FORCE)
+        self.publish_state(self.DISABLED, active=False, force=True)
         self.get_logger().info(
-            "Web teleop ready: safe uses Nav2 safety chain; force bypasses it"
+            "Web teleop ready: FORCE is explicitly armed and watchdog stops "
+            "motion without disarming it"
         )
 
     def declare_parameter_if_missing(self, name, default_value):
         if not self.has_parameter(name):
             self.declare_parameter(name, default_value)
+
+    def mode_request_callback(self, msg):
+        requested_mode = msg.data.strip().upper()
+        if requested_mode == self.FORCE:
+            self.request_force()
+        elif requested_mode == self.SAFE:
+            self.request_safe()
+        else:
+            self.get_logger().warn(
+                f"Ignoring unknown web teleop mode request: {requested_mode}"
+            )
+
+    def request_force(self):
+        transition_token = None
+        blocked_status = None
+        idempotent = False
+
+        with self.lock:
+            if mission_status_blocks_force(self.last_mission_status):
+                blocked_status = self.last_mission_status
+            elif self.mode == self.FORCE and not self.transitioning:
+                idempotent = True
+            elif self.transitioning and self.transition_target == self.FORCE:
+                idempotent = True
+            else:
+                self.transition_generation += 1
+                transition_token = self.transition_generation
+                self.transitioning = True
+                self.transition_target = self.FORCE
+                self.latest_commands[self.SAFE] = (Twist(), 0.0)
+                self.latest_commands[self.FORCE] = (Twist(), 0.0)
+                self.begin_stop_window_locked()
+
+        if blocked_status is not None:
+            self.force_safe(
+                f"FORCE_NOT_ALLOWED_{blocked_status}",
+                error=True,
+            )
+            self.get_logger().warn(
+                f"Ignoring FORCE in unsafe mission state: {blocked_status}"
+            )
+            return
+
+        if idempotent:
+            if self.mode == self.FORCE:
+                self.publish_state(self.FORCE, active=True, force=True)
+            return
+
+        self.publish_zero(self.SAFE)
+        self.publish_zero(self.FORCE)
+        self.publish_state("TRANSITIONING_FORCE", active=True)
+        self.start_transition(self.FORCE, transition_token)
+
+    def request_safe(self):
+        self.publish_zero(self.SAFE)
+        self.publish_zero(self.FORCE)
+
+        transition_token = None
+        idempotent_state = None
+        with self.lock:
+            self.latest_commands[self.SAFE] = (Twist(), 0.0)
+            self.latest_commands[self.FORCE] = (Twist(), 0.0)
+            self.begin_stop_window_locked()
+
+            if self.transitioning and self.transition_target == self.SAFE:
+                idempotent_state = "TRANSITIONING_SAFE"
+            elif self.mode == self.SAFE and not self.transitioning:
+                idempotent_state = self.SAFE
+            elif (
+                self.mode == self.DISABLED
+                and not self.transitioning
+                and mission_status_blocks_force(self.last_mission_status)
+            ):
+                idempotent_state = self.DISABLED
+            else:
+                self.transition_generation += 1
+                transition_token = self.transition_generation
+                self.transitioning = True
+                self.transition_target = self.SAFE
+
+        if idempotent_state is not None:
+            active = idempotent_state == "TRANSITIONING_SAFE"
+            self.publish_state(idempotent_state, active=active, force=True)
+            return
+
+        self.publish_state("TRANSITIONING_SAFE", active=True)
+        self.start_transition(self.SAFE, transition_token)
+
+    def start_transition(self, desired_mode, transition_token):
+        threading.Thread(
+            target=self.transition_mode,
+            args=(desired_mode, transition_token),
+            daemon=True,
+        ).start()
+
+    def transition_mode(self, desired_mode, transition_token):
+        success = False
+        error = "unknown transition error"
+        try:
+            with self.transition_call_lock:
+                if not self.transition_is_current(desired_mode, transition_token):
+                    return
+
+                if desired_mode == self.FORCE:
+                    # A confirmed lifecycle pause is the interlock that prevents
+                    # Nav2 from competing with direct FORCE output on /cmd_vel.
+                    self.cancel_navigation_goal(required=False)
+                    if not self.transition_is_current(desired_mode, transition_token):
+                        return
+                    success, error = self.call_supervisor("pause_navigation")
+                else:
+                    success, error = self.call_supervisor("start_localization")
+                    if success and self.transition_is_current(
+                        desired_mode,
+                        transition_token,
+                    ):
+                        success, error = self.call_supervisor("start_navigation")
+                    if success and self.transition_is_current(
+                        desired_mode,
+                        transition_token,
+                    ):
+                        success, error = self.cancel_navigation_goal(required=True)
+        except Exception as exc:  # keep malformed external state fail-closed
+            error = str(exc)
+            self.get_logger().error(f"Web teleop transition failed: {exc}")
+
+        with self.lock:
+            if not self.transition_is_current_locked(desired_mode, transition_token):
+                return
+
+            if (
+                desired_mode == self.FORCE
+                and mission_status_blocks_force(self.last_mission_status)
+            ):
+                success = False
+                error = f"unsafe mission state {self.last_mission_status}"
+
+            if success and not self.shutdown_event.is_set():
+                self.mode = desired_mode
+                new_state = desired_mode
+                active = desired_mode == self.FORCE
+                self.stop_until = 0.0
+            else:
+                self.mode = self.DISABLED
+                self.begin_stop_window_locked()
+                new_state = f"ERROR {desired_mode}: {error}"
+                active = False
+
+            self.transitioning = False
+            self.transition_target = None
+
+        self.publish_zero(self.SAFE)
+        self.publish_zero(self.FORCE)
+        self.publish_state(new_state, active=active)
+
+    def transition_is_current(self, desired_mode, transition_token):
+        with self.lock:
+            return self.transition_is_current_locked(desired_mode, transition_token)
+
+    def transition_is_current_locked(self, desired_mode, transition_token):
+        return (
+            self.transitioning
+            and self.transition_target == desired_mode
+            and self.transition_generation == transition_token
+            and not self.shutdown_event.is_set()
+        )
 
     def safe_callback(self, msg):
         command = clamp_twist(
@@ -139,7 +394,11 @@ class WebTeleop(Node):
             self.get_parameter("safe_max_angular_z").value,
         )
         with self.lock:
+            if self.mode != self.SAFE or self.transitioning:
+                return
             self.latest_commands[self.SAFE] = (command, time.monotonic())
+        if twist_is_zero(command):
+            self.publish_zero(self.SAFE)
 
     def force_callback(self, msg):
         command = clamp_twist(
@@ -148,7 +407,61 @@ class WebTeleop(Node):
             self.get_parameter("force_max_angular_z").value,
         )
         with self.lock:
+            if self.mode != self.FORCE or self.transitioning:
+                return
             self.latest_commands[self.FORCE] = (command, time.monotonic())
+        if twist_is_zero(command):
+            self.publish_zero(self.FORCE)
+
+    def safety_command_callback(self, msg):
+        command = msg.data.strip().upper()
+        aliases = {
+            "EMERGENCY_STOP": "ESTOP",
+            "E_STOP": "ESTOP",
+            "CANCEL": "STOP",
+        }
+        command = aliases.get(command, command)
+        if command in {"ESTOP", "STOP"}:
+            self.force_safe(f"COMMAND_{command}")
+
+    def mission_status_callback(self, msg):
+        status = msg.data.strip().upper()
+        with self.lock:
+            self.last_mission_status = status
+        if mission_status_forces_safe(status):
+            self.force_safe(f"MISSION_{status}", error=status.startswith("ERROR"))
+
+    def supervisor_status_callback(self, msg):
+        status = msg.data.strip().upper()
+        if status.startswith("ERROR"):
+            self.force_safe(f"SUPERVISOR_{status}", error=True)
+
+    def drive_status_callback(self, msg):
+        status = msg.data.strip().upper()
+        if status.startswith("ERROR"):
+            self.force_safe(f"DRIVE_MANAGER_{status}", error=True)
+
+    def force_safe(self, reason, error=False):
+        with self.lock:
+            self.transition_generation += 1
+            self.transitioning = False
+            self.transition_target = None
+            self.mode = self.DISABLED
+            self.latest_commands[self.SAFE] = (Twist(), 0.0)
+            self.latest_commands[self.FORCE] = (Twist(), 0.0)
+            self.begin_stop_window_locked()
+
+        self.publish_zero(self.SAFE)
+        self.publish_zero(self.FORCE)
+        state = f"ERROR SAFETY {reason}" if error else self.DISABLED
+        self.publish_state(state, active=False, force=True)
+        self.get_logger().warn(f"Web teleop forced safe: {reason}")
+
+    def begin_stop_window_locked(self):
+        self.stop_until = time.monotonic() + max(
+            0.0,
+            float(self.get_parameter("stop_publish_duration_sec").value),
+        )
 
     def timer_callback(self):
         now = time.monotonic()
@@ -157,122 +470,43 @@ class WebTeleop(Node):
             float(self.get_parameter("command_timeout_sec").value),
         )
 
-        start_transition = None
-        command_to_publish = None
         output_mode = None
-        zero_mode = None
-        publish_disabled = False
+        command_to_publish = None
+        repeat_stop = False
+        state = None
+        active = None
 
         with self.lock:
-            safe_command, safe_time = self.latest_commands[self.SAFE]
-            force_command, force_time = self.latest_commands[self.FORCE]
-            safe_fresh = now - safe_time <= timeout
-            force_fresh = now - force_time <= timeout
-            desired_mode = (
-                self.FORCE
-                if force_fresh
-                else self.SAFE
-                if safe_fresh
-                else self.DISABLED
-            )
-
-            if self.stop_mode is not None and now <= self.stop_until:
-                zero_mode = self.stop_mode
-            elif self.stop_mode is not None:
-                self.stop_mode = None
-
+            repeat_stop = now <= self.stop_until
             if self.transitioning:
-                return_after_zero = True
-            elif desired_mode == self.DISABLED and self.mode != self.DISABLED:
-                zero_mode = self.mode
-                self.stop_mode = self.mode
-                self.stop_until = now + max(
-                    0.0,
-                    float(self.get_parameter("stop_publish_duration_sec").value),
-                )
-                self.mode = self.DISABLED
-                publish_disabled = True
-                return_after_zero = True
-            elif desired_mode != self.DISABLED and desired_mode != self.mode:
-                zero_mode = self.mode if self.mode != self.DISABLED else zero_mode
-                self.transitioning = True
-                start_transition = desired_mode
-                return_after_zero = True
-            else:
-                return_after_zero = False
-                if desired_mode == self.SAFE:
-                    command_to_publish = safe_command
-                    output_mode = self.SAFE
-                elif desired_mode == self.FORCE:
-                    command_to_publish = force_command
-                    output_mode = self.FORCE
+                pass
+            elif self.mode == self.FORCE:
+                force_command, force_time = self.latest_commands[self.FORCE]
+                force_fresh = now - force_time <= timeout
+                command_to_publish = force_command if force_fresh else Twist()
+                output_mode = self.FORCE
+                state = self.FORCE
+                active = True
+            elif self.mode == self.SAFE:
+                safe_command, safe_time = self.latest_commands[self.SAFE]
+                safe_fresh = now - safe_time <= timeout
+                command_to_publish = safe_command if safe_fresh else Twist()
+                output_mode = self.SAFE
+                state = self.SAFE
+                active = safe_fresh
 
-        if zero_mode is not None:
-            self.publish_zero(zero_mode)
-        if publish_disabled:
-            self.publish_state(self.DISABLED, active=False)
-        if start_transition is not None:
-            self.publish_state(f"TRANSITIONING_{start_transition}", active=True)
-            threading.Thread(
-                target=self.transition_mode,
-                args=(start_transition,),
-                daemon=True,
-            ).start()
-        if return_after_zero:
-            return
-        if output_mode == self.SAFE:
+        if repeat_stop:
+            self.publish_zero(self.SAFE)
+            self.publish_zero(self.FORCE)
+        elif output_mode == self.SAFE:
             self.safe_pub.publish(command_to_publish)
         elif output_mode == self.FORCE:
             self.force_pub.publish(command_to_publish)
 
-    def transition_mode(self, desired_mode):
-        success = False
-        error = "unknown transition error"
-        try:
-            if desired_mode == self.FORCE:
-                # Cancellation is best-effort here. A confirmed lifecycle pause is
-                # the condition that prevents Nav2 from competing on /cmd_vel.
-                self.cancel_navigation_goal(required=False)
-                success, error = self.call_supervisor("pause_navigation")
-            else:
-                success, error = self.call_supervisor("start_localization")
-                if success:
-                    success, error = self.call_supervisor("start_navigation")
-                if success:
-                    success, error = self.cancel_navigation_goal(required=True)
-        except Exception as exc:  # keep malformed external state fail-closed
-            error = str(exc)
-            self.get_logger().error(f"Web teleop transition failed: {exc}")
-
-        now = time.monotonic()
-        timeout = max(
-            0.05,
-            float(self.get_parameter("command_timeout_sec").value),
-        )
-        with self.lock:
-            _, command_time = self.latest_commands[desired_mode]
-            command_still_fresh = now - command_time <= timeout
-            if success and command_still_fresh and not self.shutdown_event.is_set():
-                self.mode = desired_mode
-                new_state = desired_mode
-                active = True
-            else:
-                self.mode = self.DISABLED
-                self.stop_mode = desired_mode
-                self.stop_until = now + max(
-                    0.0,
-                    float(self.get_parameter("stop_publish_duration_sec").value),
-                )
-                new_state = (
-                    self.DISABLED
-                    if success and not command_still_fresh
-                    else f"ERROR {desired_mode}: {error}"
-                )
-                active = False
-            self.transitioning = False
-
-        self.publish_zero(desired_mode)
-        self.publish_state(new_state, active=active)
+        if state is not None:
+            self.publish_state(state, active=active)
+        else:
+            self.republish_current_state()
 
     def cancel_navigation_goal(self, required):
         timeout = float(self.get_parameter("service_timeout_sec").value)
@@ -337,26 +571,46 @@ class WebTeleop(Node):
         elif mode == self.FORCE:
             self.force_pub.publish(Twist())
 
-    def publish_state(self, state, active):
+    def publish_state(self, state, active, force=False):
         if not rclpy.ok():
             return
-        if state != self.last_status:
-            status_msg = String()
-            status_msg.data = state
-            self.status_pub.publish(status_msg)
-            self.last_status = state
+
+        now = time.monotonic()
+        period = max(
+            0.1,
+            float(self.get_parameter("state_publish_period_sec").value),
+        )
+        with self.state_publish_lock:
+            status_changed = state != self.current_status
+            active_changed = bool(active) != self.current_active
+            period_elapsed = now - self.last_state_publish_time >= period
+            self.current_status = state
+            self.current_active = bool(active)
+
+            if status_changed or force or period_elapsed:
+                status_msg = String()
+                status_msg.data = state
+                self.status_pub.publish(status_msg)
+            if status_changed or active_changed or force or period_elapsed:
+                active_msg = Bool()
+                active_msg.data = bool(active)
+                self.active_pub.publish(active_msg)
+            if status_changed or active_changed or force or period_elapsed:
+                self.last_state_publish_time = now
+
+        if status_changed:
             self.get_logger().info(f"Status: {state}")
-        active_msg = Bool()
-        active_msg.data = bool(active)
-        self.active_pub.publish(active_msg)
+
+    def republish_current_state(self):
+        with self.state_publish_lock:
+            state = self.current_status
+            active = self.current_active
+        if state is not None:
+            self.publish_state(state, active=active)
 
     def destroy_node(self):
         self.shutdown_event.set()
-        with self.lock:
-            current_mode = self.mode
-            self.mode = self.DISABLED
-        self.publish_zero(current_mode)
-        self.publish_state(self.DISABLED, active=False)
+        self.force_safe("NODE_SHUTDOWN")
         super().destroy_node()
 
 

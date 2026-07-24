@@ -136,6 +136,7 @@ START 중 START를 다시 누르면 `mission_driver`가 `BUSY` 상태를 발행�
 | 방향 | 토픽 | 타입 | 웹 앱에서의 역할 |
 | --- | --- | --- | --- |
 | Web → ROS | `/robot_command` | `std_msgs/msg/String` | `START`, `HOME`, `STOP`, `ESTOP`, `RESET` |
+| Web → ROS | `/web_teleop/mode_request` | `std_msgs/msg/String` | FORCE 래치 설정(`FORCE`) 또는 해제(`SAFE`) |
 | Web → ROS | `/cmd_vel_web_safe` | `geometry_msgs/msg/Twist` | 충돌 보호를 사용하는 기본 수동 조종 |
 | Web → ROS | `/cmd_vel_web_force` | `geometry_msgs/msg/Twist` | 충돌 보호를 우회하는 저속 탈출 조종 |
 | Web → ROS | `/initialpose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | AMCL 위치 재설정 |
@@ -161,18 +162,21 @@ transient-local 메시지로 제공합니다.
 움직이지 않을 수 있습니다. `force`는 이 보호를 의도적으로 우회합니다. 서버가
 navigation lifecycle의 PAUSE를 확인하지 못하면 force 속도를 출력하지 않습니다.
 
-force UI는 일반 모드 토글이 아니라 누르고 있는 동안만 켜지는 별도 위험 버튼으로
-구현하는 것을 권장합니다. 카메라 화면이 보이는 상태에서만 활성화하고, 사람·계단·
-낙하 위험이 있는 장소에서는 사용하지 마십시오.
+force UI는 명시적인 토글 버튼으로 구현합니다. 활성화할 때 `FORCE`, 비활성화할 때
+`SAFE`를 `/web_teleop/mode_request`에 한 번 발행합니다. 조이스틱을 놓거나 0 Twist를
+보내는 것은 로봇만 정지시키며 FORCE ARMED 상태는 해제하지 않습니다. 카메라 화면이
+보이는 상태에서만 활성화하고, 사람·계단·낙하 위험이 있는 장소에서는 사용하지 마십시오.
 
 서버에는 다음 우선순위와 제한이 적용됩니다.
 
-- safe와 force가 동시에 최신이면 force가 우선합니다.
+- FORCE ARMED에서는 `/cmd_vel_web_force`만 허용합니다.
+- SAFE 전환이 완료된 상태에서는 `/cmd_vel_web_safe`만 허용합니다.
 - `linear.x`와 `angular.z`만 사용하며 나머지 축은 서버가 0으로 만듭니다.
 - `linear.x > 0`은 전진, `< 0`은 후진입니다.
 - `angular.z > 0`은 좌회전, `< 0`은 우회전입니다.
 - NaN, Infinity와 제한을 넘는 값은 서버에서 차단하거나 clamp합니다.
-- 마지막 명령 이후 0.35초가 지나면 서버가 0 속도를 발행하고 `DISABLED`가 됩니다.
+- 마지막 명령 이후 0.35초가 지나면 서버가 0 속도를 발행합니다. FORCE ARMED 상태는
+  그대로 유지되며 다음 FORCE Twist를 받을 수 있습니다.
 
 ### rosbridge 연결 및 구독
 
@@ -193,6 +197,7 @@ function sendRos(message) {
 
 ros.addEventListener("open", () => {
   for (const publisher of [
+    {topic: "/web_teleop/mode_request", type: "std_msgs/msg/String"},
     {topic: "/cmd_vel_web_safe", type: "geometry_msgs/msg/Twist"},
     {topic: "/cmd_vel_web_force", type: "geometry_msgs/msg/Twist"},
     {topic: "/robot_command", type: "std_msgs/msg/String"},
@@ -241,6 +246,14 @@ const ZERO_TWIST = {
 let teleopTimer = null;
 let requestedMode = null;
 let latestTwist = ZERO_TWIST;
+
+function requestTeleopMode(mode) {
+  sendRos({
+    op: "publish",
+    topic: "/web_teleop/mode_request",
+    msg: {data: mode},
+  });
+}
 
 function teleopTopic(mode) {
   return mode === "force"
@@ -292,6 +305,9 @@ document.addEventListener("visibilitychange", () => {
 ros.addEventListener("close", stopTeleop);
 ```
 
+`stopTeleop()`은 속도 송신만 멈춥니다. FORCE 토글을 끌 때는 별도로
+`requestTeleopMode("SAFE")`를 호출해야 합니다.
+
 방향 버튼 연결 예시는 다음과 같습니다.
 
 ```javascript
@@ -303,6 +319,15 @@ leftButton.addEventListener("pointerdown", () => {
 });
 forceBackwardButton.addEventListener("pointerdown", () => {
   startTeleop("force", -0.05, 0.0);
+});
+
+forceToggleButton.addEventListener("click", () => {
+  if (teleopStatus === "FORCE") {
+    stopTeleop();
+    requestTeleopMode("SAFE");
+  } else {
+    requestTeleopMode("FORCE");
+  }
 });
 
 for (const button of [forwardButton, leftButton, forceBackwardButton]) {
@@ -354,14 +379,14 @@ ros.addEventListener("message", (event) => {
 | --- | --- |
 | `DISABLED` | 수동 조종 해제. START/HOME을 허용할 수 있음 |
 | `TRANSITIONING_SAFE` | localization/navigation 시작 및 goal 취소 중. 아직 움직임을 보장하지 않음 |
-| `SAFE` | safe 속도 전달 가능 |
+| `SAFE` | FORCE 해제 완료. safe 속도 전달 가능, 입력이 없으면 `active=false` |
 | `TRANSITIONING_FORCE` | goal 취소 및 navigation PAUSE 중. 아직 force 출력 안 됨 |
-| `FORCE` | 저속 force 출력 가능. 화면에 위험 상태를 명확히 표시 |
+| `FORCE` | FORCE ARMED. 입력/속도가 0이어도 `active=true`를 유지 |
 | `ERROR ...` | 송신 중단, 원인 표시. 자동으로 force를 재시도하지 않음 |
 
-START/HOME 버튼은 `/web_teleop/active=true`인 동안 비활성화해야 합니다. 조이스틱에서
-손을 뗀 직후에는 0 명령도 최신 수동 입력으로 간주되므로, 약 0.35초 뒤 서버에서
-`active=false`가 온 것을 확인한 다음 HOME을 발행합니다.
+START/HOME 버튼은 `/web_teleop/active=true`인 동안 비활성화해야 합니다. FORCE에서는
+조이스틱을 놓아도 `active=true`이므로 FORCE 토글을 끄고 `SAFE/active=false`를 확인한
+다음 START/HOME을 발행합니다.
 
 ```javascript
 function publishRobotCommand(command) {
@@ -393,6 +418,7 @@ function publishRobotCommand(command) {
 ```text
 safe 또는 force 수동 이동
 -> 모든 방향 버튼 해제
+-> FORCE를 사용했다면 /web_teleop/mode_request에 SAFE 발행
 -> /web_teleop/active=false 확인
 -> 지도에서 실제 위치와 전방 방향 선택
 -> /initialpose 발행
@@ -448,9 +474,9 @@ function publishInitialPose(x, y, yaw) {
 지도 마커와 방향이 맞는지 운영자가 확인하도록 해야 합니다. HOME 처리 과정에서
 navigation을 다시 활성화하고 costmap을 clear합니다.
 
-도킹 완료 후 `/robot_pose_status`가 `DOCKED` 또는 `DOCKED_ASSUMED`인 상태에서는
-localization이 reset되어 있으므로 `/initialpose`만 발행해도 AMCL이 처리하지 않습니다.
-이때는 고정 `docked_pose`를 지도에 표시하고 다음 START가 자동 초기화하도록 둡니다.
+도킹 완료 후에도 map_server와 AMCL localization은 복원됩니다. `/initialpose`를 발행하면
+Nav2 navigation까지 준비되지만 goal은 자동 전송되지 않습니다. 이후 START를 누르면
+수동 위치와 관계없이 기존 도크 탈출 및 자동 초기화 절차를 다시 수행합니다.
 
 ### 수동 복구 시나리오
 
@@ -459,12 +485,13 @@ localization이 reset되어 있으므로 `/initialpose`만 발행해도 AMCL이 
 ```text
 1. 카메라 스트림 확인
 2. /cmd_vel_web_safe로 먼저 탈출 시도
-3. safe가 collision monitor에 막힐 때만 force 버튼을 누른 채 저속 이동
+3. safe가 collision monitor에 막힐 때만 FORCE 토글을 켜고 저속 이동
 4. 안전한 위치에서 모든 수동 입력 해제
-5. /web_teleop/active=false 확인
-6. 실제 위치와 지도 위치가 다르면 2D Pose Estimate
-7. 새로운 /robot_pose와 방향 확인
-8. HOME을 눌러 도킹 스테이션으로 복귀
+5. FORCE 토글을 끄고 `/web_teleop/mode_request`에 SAFE 발행
+6. `/web_teleop/active=false` 확인
+7. 실제 위치와 지도 위치가 다르면 2D Pose Estimate
+8. 새로운 /robot_pose와 방향 확인
+9. HOME을 눌러 도킹 스테이션으로 복귀
 ```
 
 수동 모드에 진입하면 진행 중이던 `NavigateToPose` goal이 취소되고 기존 START 미션은
@@ -475,7 +502,8 @@ waypoint부터 순회를 계속하려면 별도의 `RESUME` 명령과 진행상�
 ### 웹 앱 구현 체크리스트
 
 - rosbridge 재연결 시 publisher advertise와 subscriber 등록을 다시 수행한다.
-- safe를 기본값으로 사용하고 force는 누르고 있는 동안만 활성화한다.
+- safe를 기본값으로 사용하고 FORCE는 명시적 토글로만 활성화/해제한다.
+- FORCE 조이스틱을 놓을 때는 0 Twist만 보내고, 토글을 끌 때만 SAFE를 요청한다.
 - Twist를 10~20 Hz로 보내고 브라우저 blur/숨김/연결 종료 때 송신을 중단한다.
 - `TRANSITIONING_*` 상태에서는 아직 로봇이 움직인다고 가정하지 않는다.
 - `ERROR`를 받으면 송신 루프를 중단하고 사용자에게 원인을 표시한다.

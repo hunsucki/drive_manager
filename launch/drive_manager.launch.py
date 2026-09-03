@@ -31,6 +31,7 @@ def generate_launch_description():
     )
 
     start_nav2 = LaunchConfiguration("start_nav2")
+    map_yaml_file = LaunchConfiguration("map")
     use_sim_time = LaunchConfiguration("use_sim_time")
     use_composition = LaunchConfiguration("use_composition")
     use_respawn = LaunchConfiguration("use_respawn")
@@ -42,6 +43,11 @@ def generate_launch_description():
                 default_value="true",
                 description="Start Nav2 in lifecycle-inactive mode",
             ),
+            DeclareLaunchArgument(
+                "map",
+                default_value=os.path.expanduser("~/map_0903.yaml"),
+                description="Full path to the map YAML file used by Nav2",
+            ),
             DeclareLaunchArgument("use_sim_time", default_value="false"),
             DeclareLaunchArgument("use_composition", default_value="False"),
             DeclareLaunchArgument("use_respawn", default_value="True"),
@@ -50,6 +56,7 @@ def generate_launch_description():
                 condition=IfCondition(start_nav2),
                 launch_arguments={
                     "autostart": "false",
+                    "map": map_yaml_file,
                     "use_sim_time": use_sim_time,
                     "use_composition": use_composition,
                     "use_respawn": use_respawn,

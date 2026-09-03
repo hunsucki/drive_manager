@@ -33,6 +33,7 @@ setup(
     entry_points={
         "console_scripts": [
             "command_manager = drive_manager.command_manager:main",
+            "front_scan_filter = drive_manager.front_scan_filter:main",
             "mission_driver = drive_manager.mission_driver:main",
             "nav2_supervisor = drive_manager.nav2_supervisor:main",
             "web_teleop = drive_manager.web_teleop:main",

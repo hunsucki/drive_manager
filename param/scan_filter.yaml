@@ -1,0 +1,12 @@
+front_scan_filter:
+  ros__parameters:
+    input_topic: /scan
+    output_topic: /scan_front_filtered
+
+    # The C1 driver publishes the physical sensor front at +/-180 degrees.
+    # The URDF yaw of pi aligns that direction with the robot's +X direction.
+    front_center_angle_deg: 180.0
+
+    # Keep the robot-front sector from -120 through +120 degrees (240 degrees).
+    # In the raw LaserScan this masks -60 through +60 degrees, i.e. the rear 120 degrees.
+    front_half_angle_deg: 120.0

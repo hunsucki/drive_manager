@@ -191,9 +191,20 @@ class WebTeleopStateTests(unittest.TestCase):
                 self.assertFalse(teleop.current_active)
                 self.assert_last_force_output(teleop, 0.0)
 
-    def test_docking_and_drive_errors_force_disabled(self):
+    def test_docking_forces_disabled(self):
+        teleop = self.make_teleop()
+        self.request_mode(teleop, "FORCE")
+        message = String()
+        message.data = "DOCKING"
+
+        teleop.mission_status_callback(message)
+
+        self.assertEqual(teleop.mode, teleop.DISABLED)
+        self.assertFalse(teleop.current_active)
+        self.assert_last_force_output(teleop, 0.0)
+
+    def test_errors_do_not_disarm_force(self):
         callbacks_and_statuses = (
-            ("mission_status_callback", "DOCKING"),
             ("mission_status_callback", "ERROR navigation_failed"),
             ("drive_status_callback", "ERROR command_manager_failed"),
             ("supervisor_status_callback", "ERROR"),
@@ -207,9 +218,21 @@ class WebTeleopStateTests(unittest.TestCase):
 
                 getattr(teleop, callback_name)(message)
 
-                self.assertEqual(teleop.mode, teleop.DISABLED)
-                self.assertFalse(teleop.current_active)
-                self.assert_last_force_output(teleop, 0.0)
+                self.assertEqual(teleop.mode, teleop.FORCE)
+                self.assertTrue(teleop.current_active)
+
+    def test_force_request_is_allowed_after_manual_nav2_error(self):
+        teleop = self.make_teleop()
+        message = String()
+        message.data = "ERROR manual_nav2_not_ready"
+        teleop.mission_status_callback(message)
+
+        self.request_mode(teleop, "FORCE")
+
+        self.assertEqual(teleop.mode, teleop.FORCE)
+        self.assertEqual(teleop.current_status, "FORCE")
+        self.assertTrue(teleop.current_active)
+        teleop.call_supervisor.assert_called_once_with("pause_navigation")
 
     def test_force_request_is_rejected_in_docking_state(self):
         teleop = self.make_teleop()

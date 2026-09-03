@@ -2,6 +2,297 @@
 
 헤드리스 Nav2 실행과 로봇 주행 미션 노드를 위한 ROS 2 패키지입니다.
 
+## Update 0903 — 전방 라이다 필터와 map_0903 적용
+
+2026-09-03 작업에서는 전방 상판 라이다의 뒤쪽을 가리는 고정 구조물 때문에 Nav2가
+로봇 자신을 장애물로 판정하던 문제를 분석하고, 로봇 전방 기준 `-120° ~ +120°`만
+사용하는 LaserScan 전처리를 추가했습니다. 동일한 필터 결과를 Cartographer 지도 작성과
+AMCL/Nav2 주행에서 사용하고, 새로 작성한 `/root/map_0903.yaml`을 launch 인자로 선택할
+수 있도록 구성했습니다.
+
+### 변경 배경과 확인된 원인
+
+기존 raw `/scan`을 `base_footprint`로 변환해 확인했을 때 padded robot footprint
+내부에 37개의 측정점이 있었고, 거리는 약 `0.063 ~ 0.208 m`였습니다. Collision
+Monitor의 `FootprintApproach.min_points`는 6이므로 이 자기반사만으로도 Nav2의 유효한
+속도 명령이 `/cmd_vel`에서 차단될 수 있었습니다. 실제 증상은 다음과 같았습니다.
+
+```text
+START_ESCAPE에서는 잠깐 전진
+-> AMCL/Nav2 활성화
+-> controller와 velocity_smoother는 속도를 생성
+-> collision_monitor가 구조물 반사를 충돌로 판정
+-> 최종 /cmd_vel이 차단되고 progress checker가 실패
+```
+
+실행 중 스캔을 로봇 좌표 기준 30° 구간으로 분석한 결과, 30 cm 이내의 근거리 반사는
+주로 후방 `+120° ~ +180°`와 `-180° ~ -150°`에 집중됐고 전방
+`-120° ~ +120°`에는 나타나지 않았습니다. 이에 따라 현재 1차 적용 범위는 전방
+240°를 남기고 후방 120°를 제거하는 것으로 결정했습니다.
+
+### C1 스캔 각도와 로봇 전방의 관계
+
+물리적으로 RPLIDAR C1의 `+X` 방향은 로봇의 `+X` 전방과 같은 방향으로 장착돼
+있습니다. 다만 SLLIDAR 드라이버의 LaserScan 각도 변환 때문에 물리적 전방은 raw
+`/scan`에서 `+/-180°`에 나타납니다. URDF의 `base_link -> base_scan` yaw `pi`는 이
+드라이버 규칙을 보정하므로 제거하거나 0으로 바꾸면 안 됩니다.
+
+현재 변환 관계는 다음과 같습니다.
+
+```text
+물리적 라이다 전방(raw 0°)
+-> SLLIDAR /scan의 +/-180°
+-> base_scan yaw pi 적용
+-> 로봇 +X 전방 0°
+```
+
+따라서 로봇 전방 `-120° ~ +120°`를 남기기 위해 필터 설정은 raw LaserScan 기준
+중심 `180°`, 반각 `120°`를 사용합니다. 결과적으로 raw 스캔 중앙
+`-60° ~ +60°`가 마스킹되며, 이 영역이 로봇 후방 120°에 해당합니다.
+
+### 추가된 front_scan_filter
+
+`drive_manager/front_scan_filter.py`에 `sensor_msgs/msg/LaserScan` 필터 노드를
+추가했습니다.
+
+```text
+/scan (raw, base_scan)
+-> front_scan_filter
+-> /scan_front_filtered (base_scan)
+```
+
+필터의 주요 동작은 다음과 같습니다.
+
+- 입력과 출력 토픽 및 필터 중심/반각을 ROS 파라미터로 설정합니다.
+- 각도 wrap-around를 고려해 `+180°`와 `-180°` 양쪽의 전방 측정값을 보존합니다.
+- 제외할 빔은 배열에서 삭제하지 않고 range를 `NaN`으로 바꿉니다.
+- 원본 `header.stamp`, `frame_id`, angle/range metadata와 intensity를 보존합니다.
+- 입출력에는 sensor-data QoS를 사용합니다.
+- raw `/scan`은 유지하므로 RViz 비교와 문제 분석에 계속 사용할 수 있습니다.
+
+설정 파일은 `param/scan_filter.yaml`입니다.
+
+```yaml
+front_scan_filter:
+  ros__parameters:
+    input_topic: /scan
+    output_topic: /scan_front_filtered
+    front_center_angle_deg: 180.0
+    front_half_angle_deg: 120.0
+```
+
+필터 실행 파일은 `setup.py`에 다음 이름으로 등록돼 있습니다.
+
+```bash
+ros2 run drive_manager front_scan_filter \
+  --ros-args --params-file \
+  /root/colcon_ws/install/drive_manager/share/drive_manager/param/scan_filter.yaml
+```
+
+일반 운용에서는 직접 실행할 필요가 없습니다. `nav2_headless.launch.py`와 STELLA의
+`stella_cartographer/launch/cartographer.launch.py`가 필터를 자동 실행합니다.
+
+### Nav2 센서 입력 변경
+
+`param/stella.yaml`에서 다음 구성요소의 입력을 raw `/scan`에서
+`/scan_front_filtered`로 변경했습니다.
+
+| 구성요소 | 0903 이후 입력 | 역할 |
+| --- | --- | --- |
+| AMCL | `/scan_front_filtered` | map 기준 localization |
+| local costmap obstacle layer | `/scan_front_filtered` | 근거리 장애물 marking/clearing |
+| global costmap obstacle layer | `/scan_front_filtered` | 전역 장애물 marking/clearing |
+| Collision Monitor | `/scan_front_filtered` | 최종 속도 충돌 검사 |
+| mission_driver readiness | `/scan_front_filtered` | 스캔 freshness와 TF 준비 확인 |
+
+기존 costmap에는 raw `/scan`과 publisher가 없는 `/scan_filtered`를 동시에 등록한
+`scan scan_2` 구성이 있었습니다. 현재 전방 라이다 한 대만 검증하는 단계이므로
+`scan_2`를 제거하고 필터된 한 개의 observation source만 사용합니다.
+
+`nav2_headless.launch.py`는 Nav2와 함께 `front_scan_filter`를 실행하며, 필터가
+비정상 종료되면 2초 뒤 respawn합니다. 필터 파라미터와 `use_sim_time`도 launch에서
+함께 전달합니다.
+
+### Cartographer 지도 작성 변경
+
+`STELLA_N5_REMOTEPC_ROS2/stella_cartographer`에도 같은 필터를 연결했습니다.
+
+- `stella_cartographer/package.xml`에 `drive_manager` 실행 의존성을 추가했습니다.
+- `cartographer.launch.py`가 `front_scan_filter`를 자동 실행합니다.
+- Cartographer의 `scan` 입력을 `/scan_front_filtered`로 remap합니다.
+- `use_sim_time`을 Cartographer, occupancy grid, RViz, scan filter에 동일하게 전달합니다.
+
+이 구성으로 맵 작성과 AMCL 주행이 동일한 라이다 관측 범위를 사용합니다. 로봇에
+고정된 상판 구조물은 환경 지도로 들어가지 않으며, 주행 시에도 장애물로 재등장하지
+않습니다.
+
+rosbag으로 맵을 작성할 때 실기 로봇 데이터와 섞이면 과거 bag timestamp와 현재 TF가
+충돌해 `TF_OLD_DATA` 및 `Message Filter dropping message`가 발생합니다. 가장 안전한
+방법은 별도 ROS domain과 simulated clock을 사용하는 것입니다.
+
+터미널 1:
+
+```bash
+cd /root/colcon_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=42
+
+ros2 launch stella_cartographer cartographer.launch.py use_sim_time:=true
+```
+
+터미널 2:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+export ROS_DOMAIN_ID=42
+
+ros2 bag play /path/to/bag --clock
+```
+
+bag에는 최소 `/scan`, `/odom`, `/tf`, `/tf_static`이 있어야 합니다. bag에
+`/tf_static`이 없다면 같은 domain에서 올바른 URDF의 `robot_state_publisher`를 별도로
+실행해야 합니다. 실기 데이터로 맵을 작성할 때는 `use_sim_time:=false`를 사용하고
+rosbag player를 동시에 실행하지 않습니다.
+
+맵 저장 예시:
+
+```bash
+export ROS_DOMAIN_ID=42
+source /opt/ros/jazzy/setup.bash
+source /root/colcon_ws/install/setup.bash
+
+ros2 run nav2_map_server map_saver_cli -f /root/map_0903
+```
+
+### map_0903과 맵 선택 방식
+
+0903 필터를 적용해 생성한 파일은 다음과 같습니다. 이 파일들은 패키지 내부가 아니라
+`/root`에 저장돼 있습니다.
+
+```text
+/root/map_0903.yaml
+/root/map_0903.pgm
+```
+
+확인된 속성은 다음과 같습니다.
+
+- resolution: `0.05 m/cell`
+- image size: `524 x 303`
+- origin: `[-11.146, -5.182, 0]`
+- Cartographer scan rate: 약 `10.01 Hz`
+- Cartographer odom rate: 약 `2.5 Hz`
+- 생성된 submap: 3개
+- 확인된 scan-match score: 주로 약 `74 ~ 84%`
+- 필터 출력의 유효 로봇 각도: 약 `-119.2° ~ +119.7°`
+- 필터 후 `+/-120°` 밖 유효점: 0개
+- padded robot footprint 내부 유효점: 기존 37개에서 0개로 감소
+
+기존 `map_0829`와 월드 좌표계의 occupied 영역 경계를 비교했을 때 차이는 대체로
+수 cm에서 약 10 cm 수준이었으며, 큰 지도 왜곡이나 필터로 인한 벽 손실은 확인되지
+않았습니다.
+
+`drive_manager.launch.py`는 `map` launch argument를 제공하며 현재 기본값은
+`/root/map_0903.yaml`입니다. 다른 맵을 사용할 때 소스를 다시 수정할 필요 없이 다음처럼
+지정합니다.
+
+```bash
+export ROS_DOMAIN_ID=0
+ros2 launch drive_manager drive_manager.launch.py map:=/root/map_0903.yaml
+```
+
+`nav2_headless.launch.py`를 직접 실행하면 해당 파일의 기본 map 설정이 사용되므로,
+운영 시에는 가급적 최상위 `drive_manager.launch.py`에 `map:=...`을 전달합니다.
+
+### START 동작 검증
+
+웹 앱에서 START를 누른 실기 시험에서 다음 흐름을 확인했습니다.
+
+```text
+시간 기반 START_ESCAPE 전진
+-> localization reset/start
+-> departure_initial_pose 반복 발행
+-> 최신 AMCL pose 3회 연속 및 map TF 검사 통과
+-> navigation 활성화와 costmap clear
+-> 첫 patrol goal 주행 시작
+```
+
+현재 구현상 START_ESCAPE 이후 Nav2 제어로 로봇이 다시 움직였다면 AMCL 안정 조건을
+통과하고 목표 주행 단계로 진입한 것입니다. 최종 판단 시에는 RViz에서 필터된 스캔이
+지도 벽과 겹치는지, 로봇이 첫 patrol point 방향의 global plan을 따라가는지도 함께
+확인합니다.
+
+### 웹 FORCE 복구 동작 보완
+
+동일 작업에서 mission/drive/Nav2가 `ERROR ...` 상태를 발행하더라도 FORCE 모드를
+자동으로 해제하지 않도록 변경했습니다. `ERROR manual_nav2_not_ready`처럼 Nav2가
+정상 주행을 시작하지 못한 상태에서도 운영자가 카메라를 확인하고 저속 FORCE로 안전한
+위치까지 복구할 수 있습니다.
+
+다음 상태는 기존대로 FORCE를 차단하거나 해제합니다.
+
+- 실제 `DOCKING` 진행 중
+- ESTOP latch 상태
+- START_ESCAPE 등 다른 노드가 `/cmd_vel`을 직접 소유하는 단계
+
+FORCE는 Collision Monitor를 우회하므로 일반 주행 기능이 아니라 제한된 복구
+수단으로만 사용해야 합니다.
+
+### 현재 범위와 후속 작업
+
+이번 0903 구성은 전방 라이다 한 대만 사용하는 1차 검증 구성입니다.
+
+- 후방 120°는 costmap과 Collision Monitor에서 보이지 않습니다.
+- 회전과 전진 주행은 가능하지만 후진/backup 동작의 후방 충돌 보호는 제한됩니다.
+- START_ESCAPE는 Nav2를 pause하고 `/cmd_vel`에 직접 속도를 발행하므로 Collision
+  Monitor를 우회합니다. 도크 이탈 중 전방 안전 감시는 추후 별도 보완이 필요합니다.
+- `base_scan2` 프레임과 두 번째 라이다 위치는 URDF에 선언돼 있지만, 현재
+  `/scan_front_filtered` 파이프라인에는 두 번째 라이다를 연결하지 않았습니다.
+- 후속 단계에서는 앞 라이다의 전방 영역과 뒤 라이다의 후방 영역을 각각 필터링해
+  Cartographer, AMCL, costmap, Collision Monitor에 함께 제공할 예정입니다.
+
+`STELLA_N5_REMOTEPC_ROS2` 작업 트리에는 두 번째 라이다 이동을 반영하기 위해 세 URDF의
+`base_scan2` 위치를 `xyz="-0.166 0.0 0.223"`, yaw를 `3.1415`로 변경한 내용도
+포함돼 있습니다. 실제 설치 위치의 `x/y/z`를 다시 측정한 뒤 확정해야 합니다.
+`stella_navigation2/param/stella_senser.yaml`의 카메라 프로필은 `use_realsense`로
+변경돼 있습니다. 이 두 변경은 현재 단일 전방 라이다 필터 동작과는 별도입니다.
+
+### 빌드 및 검증
+
+두 패키지를 함께 빌드합니다.
+
+```bash
+cd /root/colcon_ws
+source /opt/ros/jazzy/setup.bash
+
+colcon build \
+  --packages-select drive_manager stella_cartographer \
+  --symlink-install
+
+source install/setup.bash
+```
+
+검증 시 다음 결과를 확인했습니다.
+
+- `drive_manager`, `stella_cartographer` 빌드 성공
+- 두 launch 파일의 `--show-args` 로딩 성공
+- `drive_manager` 전체 Python test 23개 통과
+- 신규 각도 wrap/boundary 필터 test 3개 포함
+- `git diff --check` 통과
+
+필터 출력 확인:
+
+```bash
+ros2 topic info /scan_front_filtered -v
+ros2 topic echo /scan_front_filtered --qos-reliability best_effort
+```
+
+빌드 중 `setup.py: option --editable/--uninstall not recognized`가 발생했던 환경에서는
+시스템의 `setuptools 81.0.0`과 ROS 2 Python 빌드 도구의 호환 문제가 있었고,
+`setuptools 79.0.1`로 맞춘 뒤 빌드가 정상화됐습니다. 기존 빌드 실패가 남긴 install
+symlink와 충돌하면 해당 패키지의 `build/drive_manager` 및 `install/drive_manager`만
+정리한 뒤 다시 빌드해야 하며, 작업공간 전체를 무조건 삭제하지 마십시오.
+
 ## 통합 서버 실행
 
 ```bash
@@ -161,6 +452,9 @@ transient-local 메시지로 제공합니다.
 `safe`는 기존 collision monitor를 통과하므로 장애물이나 잘못 남은 costmap 때문에
 움직이지 않을 수 있습니다. `force`는 이 보호를 의도적으로 우회합니다. 서버가
 navigation lifecycle의 PAUSE를 확인하지 못하면 force 속도를 출력하지 않습니다.
+`ERROR manual_nav2_not_ready`를 포함한 mission/drive/Nav2 오류 상태는 복구를 위해
+force 진입을 막지 않습니다. 다만 E-stop이 래치된 상태, 실제 도킹 진행 중, 또는
+다른 직접 속도 출력 단계에서는 force를 거부합니다.
 
 force UI는 명시적인 토글 버튼으로 구현합니다. 활성화할 때 `FORCE`, 비활성화할 때
 `SAFE`를 `/web_teleop/mode_request`에 한 번 발행합니다. 조이스틱을 놓거나 0 Twist를
@@ -623,6 +917,12 @@ ssh -i /root/.ssh/id_ed25519_drive_manager user@192.168.0.3 \
 
 아래 내용은 실행 중인 ROS 2 그래프에서 다음 명령으로 수집했습니다.
 
+> 0903 변경 이후 라이다의 실제 주행 경로는
+> `/scan -> /scan_front_filtered -> AMCL/costmap/Collision Monitor`입니다. 아래 표는
+> 특정 실행 시점의 전체 그래프 스냅샷이므로 외부에서 실행한 legacy
+> `/scan_to_scan_filter_chain`과 `/scan_filtered`가 포함될 수 있지만, 현재
+> `drive_manager`는 `/scan_filtered`를 사용하지 않습니다.
+
 ```bash
 ros2 topic list -t
 ros2 topic info --verbose <topic>
@@ -737,6 +1037,7 @@ ros2 topic info --verbose <topic>
 | `/route_server/transition_event` | `lifecycle_msgs/msg/TransitionEvent` | 1 | `/route_server` | route server의 lifecycle 상태 전환 이벤트입니다. |
 | `/scan` | `sensor_msgs/msg/LaserScan` | 1 | `/sllidar_node` | 첫 번째 SLLIDAR의 laser scan입니다. |
 | `/scan_2` | `sensor_msgs/msg/LaserScan` | 1 | `/sllidar2_node` | 두 번째 SLLIDAR의 laser scan입니다. |
+| `/scan_front_filtered` | `sensor_msgs/msg/LaserScan` | 1 | `/front_scan_filter` | 0903 이후 AMCL, costmap, Collision Monitor, Cartographer가 사용하는 전방 +/-120° 필터 스캔입니다. |
 | `/scan_filtered` | `sensor_msgs/msg/LaserScan` | 1 | `/scan_to_scan_filter_chain` | scan filter chain을 거친 필터링 laser scan입니다. |
 | `/sk120/available` | `sensor_msgs/msg/BatteryState` | 1 | `/battery_node` | SK120 전원 공급 장치/배터리 사용 가능 상태입니다. |
 | `/sk120/cmd_output` | `std_msgs/msg/Bool` | 0 | - | SK120 output enable/disable 명령 입력이며, 수집 시점에는 발행자가 없었습니다. |

@@ -52,7 +52,6 @@ def mission_status_forces_safe(status):
     }
     return (
         normalized in exact_statuses
-        or normalized.startswith("ERROR")
         or normalized.startswith("DOCKING")
         or normalized.startswith("ESTOP_LATCHED ")
     )
@@ -434,12 +433,16 @@ class WebTeleop(Node):
     def supervisor_status_callback(self, msg):
         status = msg.data.strip().upper()
         if status.startswith("ERROR"):
-            self.force_safe(f"SUPERVISOR_{status}", error=True)
+            self.get_logger().warn(
+                f"Nav2 supervisor reported {status}; FORCE remains available"
+            )
 
     def drive_status_callback(self, msg):
         status = msg.data.strip().upper()
         if status.startswith("ERROR"):
-            self.force_safe(f"DRIVE_MANAGER_{status}", error=True)
+            self.get_logger().warn(
+                f"Drive manager reported {status}; FORCE remains available"
+            )
 
     def force_safe(self, reason, error=False):
         with self.lock:

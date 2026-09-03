@@ -58,12 +58,18 @@ def generate_launch_description():
     rviz_config_file = LaunchConfiguration("rviz_config_file")
 
     default_params_file = os.path.join(drive_manager_dir, "param", "stella.yaml")
+    scan_filter_params_file = os.path.join(
+        drive_manager_dir,
+        "param",
+        "scan_filter.yaml",
+    )
     default_urdf_model = os.path.join(
         drive_manager_dir,
         "urdf",
         "stella_realsense.urdf",
     )
-    default_map_file = os.path.join(drive_manager_dir, "map", "map.yaml")
+    #default_map_file = os.path.join(drive_manager_dir, "map", "map.yaml")
+    default_map_file = os.path.expanduser("~/map_0829.yaml")
     default_rviz_config_file = os.path.join(
         drive_manager_dir,
         "rviz",
@@ -95,6 +101,16 @@ def generate_launch_description():
         arguments=["-d", rviz_config_file],
         parameters=[{"use_sim_time": use_sim_time}],
         output="screen",
+    )
+
+    scan_filter_cmd = Node(
+        package="drive_manager",
+        executable="front_scan_filter",
+        name="front_scan_filter",
+        parameters=[scan_filter_params_file, {"use_sim_time": use_sim_time}],
+        output="screen",
+        respawn=True,
+        respawn_delay=2.0,
     )
 
     return LaunchDescription(
@@ -173,6 +189,7 @@ def generate_launch_description():
             OpaqueFunction(function=launch_setup),
             LogInfo(msg=["Using map file: ", map_yaml_file]),
             LogInfo(msg=["Using params file: ", params_file]),
+            scan_filter_cmd,
             bringup_cmd,
             rviz_cmd,
         ]

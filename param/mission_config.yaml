@@ -21,7 +21,7 @@ mission_driver:
     manual_initial_pose_starts_navigation: true
     keep_localization_active_when_idle: true
     odom_topic: "/odom"
-    scan_topic: "/scan"
+    scan_topic: "/scan_front_filtered"
     amcl_pose_topic: "/amcl_pose"
     initial_pose_topic: "/initialpose"
     robot_pose_topic: "/robot_pose"

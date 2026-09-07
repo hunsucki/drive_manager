@@ -2,6 +2,38 @@
 
 헤드리스 Nav2 실행과 로봇 주행 미션 노드를 위한 ROS 2 패키지입니다.
 
+## 도킹 후 capture 폴더 동기화
+
+`mission_config.yaml`의 `capture_sync_enabled: true`이면 START 또는 HOME의 실제
+도킹 명령이 성공한 직후, 서버가 로봇의 `~/capture/` 전체를 서버의 `~/capture/`로
+SSH + rsync로 가져옵니다. `docking_ssh_*` 접속 설정을 그대로 사용하며 현재 대상은
+`user@192.168.0.15:/home/user/capture/` → `/root/capture/`입니다.
+서버 경로의 `~`는 mission_driver 실행 사용자의 홈으로 해석됩니다.
+
+- 양쪽 장비에 `rsync`가 설치되어 있어야 합니다 (`sudo apt-get install rsync`).
+- 이미지, metadata, 숨김 파일을 포함하여 하위 폴더 구조를 유지합니다.
+- 크기/수정 시각이 같은 파일은 건너뛰며 변경된 파일은 갱신합니다.
+- 서버에만 있는 파일은 보존합니다. 양방향 동기화나 삭제 미러링은 하지 않습니다.
+- ROS/미션 처리와 별도 스레드에서 실행하며 전송은 한 번에 하나만 수행합니다.
+- 실패 시 10초 간격으로 최대 3회 시도합니다. 각 시도 제한은 1800초이며
+  `capture_sync_attempts`, `capture_sync_retry_delay_sec`, `capture_sync_timeout_sec`로
+  조절합니다. 다음 도킹 때도 전체 폴더를 다시 검사하므로 누락 파일을 재전송합니다.
+- 중간 파일은 `.rsync-partial`에 보관합니다. 노드 종료 시 전송 프로세스도 종료합니다.
+- 도킹 생략/실패/중단이나 시작 시 도킹 상태 가정만으로는 전송하지 않습니다.
+- `capture_enabled`와 독립적이므로 HOME 복귀 때도 이전 촬영 파일을 가져옵니다.
+
+상태는 `/capture_sync/status` (`std_msgs/msg/String`, transient local)에
+`SYNCING`, `SYNC_RETRYING`, `SYNC_SUCCEEDED`, `SYNC_FAILED`로 발행합니다.
+오류 상세는 mission_driver 로그에 남으며 동기화 실패가 도킹 성공을 취소하지 않습니다.
+
+```bash
+ros2 topic echo /capture_sync/status --qos-durability transient_local
+```
+
+전체 폴더를 그대로 복사하므로 진행 중/중단된 촬영 회차도 포함됩니다.
+전송 도중에는 서버의 `READY` 파일만으로 전체 다운로드 완료를 판정하지 마세요.
+다음 촬영이 동시에 시작되면 변경 중인 파일은 다음 동기화에서 다시 갱신됩니다.
+
 ## Update 0903 — 전방 라이다 필터와 map_0903 적용
 
 2026-09-03 작업에서는 전방 상판 라이다의 뒤쪽을 가리는 고정 구조물 때문에 Nav2가
@@ -222,6 +254,39 @@ ros2 launch drive_manager drive_manager.launch.py map:=/root/map_0903.yaml
 지도 벽과 겹치는지, 로봇이 첫 patrol point 방향의 global plan을 따라가는지도 함께
 확인합니다.
 
+### 정지 상태의 웹/RViz 2D Pose 활성화
+
+웹 앱이나 RViz에서 `/initialpose`를 한 번 발행하면 `mission_driver`가 수신한
+`x/y/yaw`를 보관합니다. worker가 localization lifecycle의 active 상태를 확인한 뒤
+저장한 pose를 현재 timestamp로 즉시 다시 발행하고, AMCL이 안정될 때까지 0.5초마다
+반복합니다. 이 처리는 로봇이 정지해 있어 AMCL의 이동 임계값을 넘지 못해도 최신
+`/amcl_pose` 샘플을 만들기 위한 것입니다.
+
+```text
+웹 또는 RViz에서 /initialpose 한 번 발행
+-> mission_driver가 x/y/yaw 저장
+-> localization active 확인
+-> 저장한 pose를 새 timestamp로 반복 발행
+-> 최신 AMCL pose 3개, covariance, map TF 확인
+-> navigation lifecycle 활성화
+-> costmap clear
+-> MANUAL_NAV2_READY
+```
+
+수동 pose 처리에서는 NavigateToPose goal을 자동으로 보내지 않습니다. 따라서
+`MANUAL_NAV2_READY` 이후 웹 goal, RViz Nav2 Goal 또는 HOME 명령을 바로 사용할 수
+있습니다. 실패하면 `ERROR manual_nav2_not_ready`를 발행하며 웹 앱은 성공과 실패
+상태 모두에서 대기 UI를 종료해야 합니다.
+
+이전 구현은 웹 pose의 실제 값을 저장하지 않고 pending boolean만 queue에 넣었습니다.
+AMCL이 `/initialpose` 직후 한 번 발행한 pose가 worker의 대기 시작보다 빨리 도착하면
+freshness 검사에서 제외됐고, 정지 상태에서는 `update_min_d=0.25 m`,
+`update_min_a=0.2 rad`를 넘지 않아 추가 pose가 나오지 않는 race condition이
+있었습니다. 0903 후속 수정은 저장한 pose를 localization 활성화 이후 반복 발행해 이
+경쟁 조건을 제거합니다. 수십 ms의 odom 지연으로 나타날 수 있는 initial pose TF
+extrapolation 경고 뒤에 `Setting pose`가 출력된다면 그 경고 자체는 실패 원인이
+아닙니다.
+
 ### 웹 FORCE 복구 동작 보완
 
 동일 작업에서 mission/drive/Nav2가 `ERROR ...` 상태를 발행하더라도 FORCE 모드를
@@ -276,7 +341,7 @@ source install/setup.bash
 
 - `drive_manager`, `stella_cartographer` 빌드 성공
 - 두 launch 파일의 `--show-args` 로딩 성공
-- `drive_manager` 전체 Python test 23개 통과
+- `drive_manager` 전체 Python test 25개 통과
 - 신규 각도 wrap/boundary 필터 test 3개 포함
 - `git diff --check` 통과
 
@@ -411,6 +476,51 @@ ros2 topic echo /mission_route_points
 
 START 중 START를 다시 누르면 `mission_driver`가 `BUSY` 상태를 발행하고 기존 미션을 계속 진행합니다. START 중 HOME을 누르면 현재 goal을 취소하고 HOME 복귀 미션으로 전환합니다.
 
+### HOME 도착과 도킹 전 방향 보정
+
+`HOME` 명령과 `START` 순찰 마지막 복귀는 모두 다음 순서로 처리합니다.
+
+```text
+NAVIGATING HOME_TO_DOCK (위치 15cm / 방향 0.10rad 이내)
+-> 촬영 run 종료 (START만)
+-> HOME_ALIGNING (정지 확인 / 최신 map TF로 오차 확인 / 필요하면 Spin)
+-> 위치 15cm / 방향 약 3도 이내 재확인
+-> Nav2 navigation pause
+-> DOCKING (SSH 도킹 실행)
+```
+
+`behavior_trees/navigate_home.xml`은 HOME 전용 `HomeFollowPath`,
+`home_goal_checker`, `home_progress_checker`를 선택합니다. 순찰과 일반 Nav2 goal은
+기존 `FollowPath`와 `precise_goal_checker`의 30cm / 0.3rad 기준을 유지합니다.
+여러 checker를 등록하므로 기본 NavigateToPose/ThroughPoses 트리에도 기존 checker
+ID를 명시했습니다. 별도 사용자 BT를 사용한다면 FollowPath의 `goal_checker_id`와
+`progress_checker_id`도 명시해야 합니다.
+
+HOME 컨트롤러는 회전 전환 반경을 15cm로 맞추고 정지 판단 속도를 0.03m/s로
+낮췄습니다. HOME progress checker는 위치 이동뿐 아니라 회전도 진행으로 인정합니다.
+도착 후에는 정지한 odometry를 확인하고, 0.5초 이내의 `map -> base_link` TF로
+오차를 계산합니다. 방향 오차가 약 3도보다 크면 Nav2 `/spin`으로 최단 방향을
+보정합니다. 회전은 최대 3회, 회당 15초로 제한하며 회전 후 정지·위치·방향을
+다시 확인합니다. 이미 정렬돼 있으면 회전하지 않습니다.
+
+정지 확인에는 기존 `capture_stop_settle_sec`, `capture_stop_timeout_sec`,
+`capture_stopped_linear_mps`, `capture_stopped_angular_rps` 기준을 공유합니다.
+`mission_config.yaml`의 `home_alignment_*`, `home_pose_max_age_sec`로 보정 조건을
+조절할 수 있습니다. 위치 기준 변경 시 `home_arrival_xy_tolerance_m`과
+`stella.yaml`의 `home_goal_checker.xy_goal_tolerance`,
+`HomeFollowPath.xy_goal_tolerance`를 함께 맞춰야 합니다.
+
+위치 이탈, 오래되거나 미래 시각인 TF, 정지 확인 실패, 회전 실패·시간 초과 시에는
+`ERROR home_alignment_failed`와 미션 실패를 발행하며 도킹을 실행하지 않습니다.
+`HOME_ALIGNING` 중 STOP/ESTOP은 회전을 취소하고 웹 FORCE 조작도 차단합니다.
+이 보정은 설정된 `home_to_dock_pose`의 yaw를 기준으로 하므로, 해당 yaw가 실제
+태그 정면을 향하도록 보정돼 있어야 합니다. 태그 인식과 원격 도킹 노드의 TF 시간
+오류는 별도로 확인해야 합니다.
+
+변경 적용은 `colcon build --packages-select drive_manager --symlink-install` 후
+기존 drive_manager launch를 종료하고 다시 실행합니다. Nav2 controller와 mission
+driver를 함께 재시작해야 새 HOME 플러그인과 도킹 전 보정이 모두 적용됩니다.
+
 ## 웹 앱 연동 가이드
 
 웹 앱은 `ws://<서버 IP>:9090`의 rosbridge WebSocket에 연결합니다. 이번 변경으로
@@ -437,6 +547,10 @@ START 중 START를 다시 누르면 `mission_driver`가 `BUSY` 상태를 발행�
 | ROS → Web | `/robot_pose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | 지도에 표시할 현재 위치 |
 | ROS → Web | `/robot_pose_status` | `std_msgs/msg/String` | 위치 출처: `AMCL`, `DOCKED`, `DOCKED_ASSUMED` |
 | ROS → Web | `/mission_route_points` | `std_msgs/msg/String` | HOME/순회 좌표와 주행 순서 JSON |
+| ROS → Camera | `/camera/capture_run/start` | `inspection_interfaces/srv/StartCaptureRun` | 촬영 run 생성 및 지도/구역 스냅샷 전달 |
+| ROS → Camera | `/camera/capture_pair` | `inspection_interfaces/srv/CapturePair` | 구역·AMCL pose·요청 ID와 함께 좌우 촬영 요청 |
+| ROS → Camera | `/camera/capture_run/finish` | `inspection_interfaces/srv/FinishCaptureRun` | 마지막 촬영 완료 후 READY 생성 요청 |
+| ROS → Camera | `/camera/capture_run/abort` | `inspection_interfaces/srv/AbortCaptureRun` | 중단된 미션의 run 종료 요청 |
 
 지도에는 `/amcl_pose` 대신 `/robot_pose`를 표시해야 합니다. `/robot_pose`는 주행
 중에는 AMCL 위치를 전달하고, Nav2가 reset된 도킹 상태에서는 설정된 `docked_pose`를
@@ -825,6 +939,33 @@ mission_driver:
     route_points_topic: "/mission_route_points"
     route_points_publish_period_sec: 1.0
 
+    # patrol_points처럼 사용할 구역 이름만 순서대로 지정
+    capture_enabled: false
+    capture_required: true
+    capture_zone_names: ["A", "B"]
+    capture_min_distance_m: 1.0
+    capture_trigger_min_linear_mps: 0.02
+    capture_trigger_max_angular_rps: 0.15
+    capture_goal_exclusion_radius_m: 0.30
+    capture_stop_settle_sec: 0.7
+    capture_stop_timeout_sec: 3.0
+    capture_stopped_linear_mps: 0.02
+    capture_stopped_angular_rps: 0.05
+    capture_pose_timeout_sec: 2.0
+    capture_service_timeout_sec: 35.0
+    capture_finish_wait_timeout_sec: 40.0
+    capture_failure_stops_mission: false
+    capture_map_id: "map_0903"
+    capture_zone_revision: "yaml_v1"
+    capture_run_start_service: "/camera/capture_run/start"
+    capture_pair_service: "/camera/capture_pair"
+    capture_run_finish_service: "/camera/capture_run/finish"
+    capture_run_abort_service: "/camera/capture_run/abort"
+    capture_zones:
+      # 대각선 두 점, 단위 meter, frame map: [x1, y1, x2, y2]
+      A: [0.0, 0.0, 1.0, 1.0]
+      B: [1.0, 0.0, 2.0, 1.0]
+
     home_to_patrol_pose: [-0.265, 4.405, -1.5708]
     home_to_dock_pose: [-0.265, 4.405, 1.0472]
     departure_initial_pose: [-0.265, 4.405, -1.5708]
@@ -858,6 +999,80 @@ mission_driver:
     docking_stop_grace_sec: 3.0
 ```
 
+### 구역별 짐벌 카메라 촬영
+
+구역 이름과 개수는 `capture_zone_names`에서 정합니다. 각 사각형의 대각선 방향 두 점을
+`capture_zones.<name>: [x1, y1, x2, y2]` 형식으로 입력합니다. 좌표 단위는 meter이고
+좌표계는 Nav2의 `map` 프레임입니다. 내부에서 min/max를 계산하므로 웹에서 어느 방향으로
+드래그했는지는 상관없으며 경계선도 구역 안으로 판정합니다. 구역이 겹치면
+`capture_zone_names`에 먼저 나열된 구역을 사용하므로 한 주기에 촬영 명령이 중복되지
+않습니다.
+
+`map.pgm`은 점유 지도를 픽셀로 저장한 이미지일 뿐이므로 PGM 픽셀 번호를 YAML에 직접
+입력하면 안 됩니다. 같은 이름의 `map.yaml`에 있는 `resolution`과 `origin`이 픽셀을
+`map` 프레임의 meter 좌표로 연결합니다. 현재 기본 실행 지도인 `map_0903.yaml`은
+해상도 `0.05 m/pixel`, origin `[-11.146, -5.182, 0]`입니다. 가장 간단하고 안전한
+좌표 취득 방법은 RViz의 `Publish Point` 도구로 대각선 두 모서리를 누르면서 다음 토픽 값을
+기록하는 것입니다.
+
+```bash
+ros2 topic echo /clicked_point geometry_msgs/msg/PointStamped
+```
+
+PGM 픽셀 `(column, row)`을 꼭 변환해야 한다면 현재처럼 origin yaw가 0인 지도에서
+셀 중심의 근사 좌표는 아래와 같습니다. PGM의 row는 위에서 아래로 증가하기 때문에
+y축을 뒤집어야 합니다.
+
+```text
+x = origin_x + (column + 0.5) * resolution
+y = origin_y + (image_height - row - 0.5) * resolution
+```
+
+`capture_zone_names`에는 `patrol_points`처럼 이번 실행에서 사용할 구역 이름만 순서대로
+나열합니다. 각 이름에 대응하는 `capture_zones.<name>` 좌표가 있어야 합니다. 구역 개수는
+고정되어 있지 않으며 목록 순서는 겹치는 구역에서 어느 구역을 먼저 선택할지 결정합니다.
+구역을 사용하지 않을 때는 빈 배열을 넣지 말고 `capture_enabled: false`로 설정합니다.
+ROS 2 Jazzy는 타입 정보가 없는 빈 배열 파라미터를 로드하지 못할 수 있습니다.
+현재는 YAML에서 구역을 읽지만 판정/촬영 로직과 설정 로딩을 분리해 두었으므로, 추후
+웹 앱이 드래그 결과를 토픽이나 서비스로 전송하면 이름 목록과 구역 데이터만 갱신하는 방식으로
+확장할 수 있습니다.
+
+카메라 run은 START 미션의 Nav2/AMCL 준비가 완료된 뒤 시작됩니다. 촬영 요청은 `START`
+미션이 활성 상태이고 Nav2/AMCL 위치가 정상일 때만 발생합니다.
+`HOME`, 수동 초기 위치 설정, 도킹, STOP/ESTOP 상태에서는 발행하지 않습니다. 구역에
+들어오면 즉시 정지 촬영하고, 머무르는 동안 마지막 촬영 위치로부터
+`capture_min_distance_m` 이상 이동할 때마다 다시 정지 촬영합니다. 촬영 시 현재
+`NavigateToPose` goal을 제어된 방식으로 취소하고, odometry가 설정된 속도 이하로
+`capture_stop_settle_sec` 동안 유지되는 것을 확인한 뒤 `CapturePair`를 호출합니다. 촬영이
+끝나면 동일한 Nav2 목적지를 다시 전송해 순회를 계속합니다. 위치가
+`capture_pose_timeout_sec`보다 오래되거나 정지 확인이 `capture_stop_timeout_sec` 안에
+끝나지 않으면 해당 촬영을 건너뜁니다. 한 번에 하나의 `CapturePair` 요청만 허용하며 마지막
+응답을 받은 뒤에만 finish 서비스를 호출합니다.
+
+START 미션의 복귀 구간인 `HOME_TO_DOCK`에서는 촬영하지 않습니다. 또한 선속도가
+`capture_trigger_min_linear_mps`보다 낮거나 각속도가
+`capture_trigger_max_angular_rps`보다 높은 동안에는 제자리 yaw 정렬로 판단해 촬영하지
+않습니다. Nav2 feedback의 남은 거리가 `capture_goal_exclusion_radius_m` 이내인 최종
+waypoint 정렬 구간도 제외합니다.
+
+HOME 명령은 내부의 `DOCKED` 추정 상태와 관계없이 항상 현재 위치에서
+`home_to_dock_pose`로 Nav2 이동한 뒤 navigation을 pause하고 도킹 명령을 실행합니다.
+START 순회 중 HOME을 누르면 현재 goal을 취소하고 진행 중인 카메라 run을 abort한 다음
+동일한 HOME 절차를 실행합니다.
+
+로봇 카메라 서버가 준비됐는지는 다음 명령으로 확인할 수 있습니다.
+
+```bash
+ros2 service type /camera/capture_run/start
+ros2 service type /camera/capture_pair
+ros2 service type /camera/capture_run/finish
+ros2 service type /camera/capture_run/abort
+```
+
+서비스 타입은 별도 `inspection_interfaces` ROS 2 패키지에 있습니다. 카메라 서버의
+상태 머신, callback 동작, metadata schema와 시험 항목은
+[카메라 서비스 연동 명세](CAMERA_SERVICE_INTEGRATION.md)를 따릅니다.
+
 START 미션 순서는 항상 아래와 같습니다.
 
 ```text
@@ -868,8 +1083,11 @@ START_ESCAPE
 -> departure_initial_pose 발행
 -> AMCL 공분산 및 map → base_link TF 확인
 -> navigation STARTUP 및 costmap clear
+-> camera capture run START (mission/map/활성 구역 스냅샷)
 -> patrol_points 순서대로 순회
+-> 구역 안에서 CapturePair를 최대 1 Hz, 한 번에 한 요청씩 실행
 -> HOME_TO_DOCK
+-> 마지막 CapturePair 응답 대기 및 camera run FINISH
 -> navigation PAUSE
 -> SSH docking command
 -> 도킹 성공(exit code 0)

@@ -27,6 +27,42 @@ mission_driver:
     robot_pose_topic: "/robot_pose"
     robot_pose_status_topic: "/robot_pose_status"
     web_teleop_active_topic: "/web_teleop/active"
+    # START 순회에서 카메라 run/capture/finish/abort 서비스를 사용합니다.
+    # patrol_points와 같은 방식으로 사용할 구역 이름만 나열합니다.
+    # 아래 A/B 좌표는 형식 확인용 예시이므로 실제 map 좌표로 교체하세요.
+    capture_enabled: true
+    capture_required: true
+    # 구역 진입 시 한 번, 이후 마지막 촬영 위치에서 이 거리만큼 이동할 때마다 촬영합니다.
+    capture_min_distance_m: 1.5
+    # 직진 이동 중에만 촬영하며 waypoint 제자리 yaw 정렬 중에는 촬영하지 않습니다.
+    capture_trigger_min_linear_mps: 0.02
+    capture_trigger_max_angular_rps: 0.15
+    # 각 waypoint의 최종 yaw 정렬 구간을 확실히 제외합니다.
+    capture_goal_exclusion_radius_m: 0.30
+    # Nav2 goal 취소 후 odometry가 정지 상태로 유지되어야 하는 시간입니다.
+    capture_stop_settle_sec: 0.7
+    capture_stop_timeout_sec: 3.0
+    capture_stopped_linear_mps: 0.02
+    capture_stopped_angular_rps: 0.05
+    capture_pose_timeout_sec: 2.0
+    # 카메라 서버의 RTSP 장애 시 최악 지연(약 30초)을 허용합니다.
+    capture_service_timeout_sec: 35.0
+    capture_finish_wait_timeout_sec: 40.0
+    # 개별 촬영 실패는 metadata에 남기고 순회는 계속합니다.
+    capture_failure_stops_mission: false
+    capture_map_id: "map_0903"
+    capture_zone_revision: "yaml_v1"
+    capture_run_start_service: "/camera/capture_run/start"
+    capture_pair_service: "/camera/capture_pair"
+    capture_run_finish_service: "/camera/capture_run/finish"
+    capture_run_abort_service: "/camera/capture_run/abort"
+
+    capture_zone_names: ["A", "B"]
+    capture_zones:
+      # 대각선 방향의 두 점을 입력합니다. 점의 순서는 상관없습니다.
+      # 형식: [x1, y1, x2, y2], 단위: meter, frame: map
+      A: [-0.821, 2.043, 1.079, 4.543]
+      B: [-0.771, -0.357, 1.029, 1.493]
     odom_frame: "odom"
     base_frame: "base_link"
     map_frame: "map"
@@ -48,14 +84,34 @@ mission_driver:
 
     # HOME 위치는 방향이 중요해서 yaw까지 직접 관리합니다.
     # 형식은 [x, y, yaw(rad)] 입니다.
-    home_to_patrol_pose: [-0.265, 4.405, -1.5708]
-    home_to_dock_pose: [-0.265, 4.405, 1.0472]
+    # home_to_patrol_pose: [-0.265, 4.405, -1.5708]
+    # home_to_dock_pose: [-0.265, 4.405, 1.0472]
+
+    # map_0903버전
+    home_to_patrol_pose: [0.079, 4.793, -1.5708]
+    home_to_dock_pose: [0.0129, 4.793, 1.5708]
+    # HOME 전용 Nav2 기준: stella.yaml의 home_goal_checker (15cm / 0.10rad).
+    # 도착 후 정지 확인 -> 최신 map TF 검사 -> /spin 보정 -> 재검사 후 도킹.
+    # 이 위치 기준은 home_goal_checker / HomeFollowPath.xy_goal_tolerance와 맞춥니다.
+    home_arrival_xy_tolerance_m: 0.15
+    home_alignment_yaw_tolerance_rad: 0.0524  # 약 3도
+    home_alignment_max_attempts: 3
+    home_alignment_timeout_sec: 15.0  # 회전 1회당 제한
+    home_pose_max_age_sec: 0.5
+    home_spin_action: "/spin"
 
     # 도크에서 2초간 빠져나온 직후의 지도상 예상 위치/전방 방향입니다.
     # START 때 이 값을 /initialpose로 넣고 AMCL 수렴을 확인합니다.
-    departure_initial_pose: [-0.265, 4.405, -1.5708]
+    # departure_initial_pose: [-0.265, 4.405, -1.5708]
+
+    # map_0903버전
+    departure_initial_pose: [-0.029, 5.943, -1.5708]
+
 
     # 도킹 완료 후 웹에 표시할 고정 위치입니다. 실제 최종 체결 위치로 보정하세요.
+    # docked_pose: [-0.265, 4.405, 1.0472]
+
+    #map_0903버전
     docked_pose: [-0.265, 4.405, 1.0472]
 
     # START 명령:
@@ -63,11 +119,17 @@ mission_driver:
     #
     # patrol 포인트는 [x, y]만 관리합니다.
     # 각 patrol 포인트의 yaw는 다음 목표 좌표를 바라보도록 자동 계산됩니다.
-    patrol_points: ["point_1", "point_2", "point_3"]
+
+    # patrol_points: ["point_1", "point_2", "point_3"]
+    # patrol:
+    #   point_1: [-0.165, -0.145]
+    #   point_2: [3.735, -0.045]
+    #   point_3: [-0.165, -0.145]
+
+    patrol_points: ["point_1"]
     patrol:
-      point_1: [-0.165, -0.145]
-      point_2: [3.735, -0.045]
-      point_3: [-0.165, -0.145]
+      point_1: [0.329, 0.393]
+
 
     # 도킹스테이션에서 START할 때 Nav2/collision_monitor가 바로 막히지 않도록
     # 먼저 짧게 빠져나오는 단계입니다. linear_x가 양수면 전진입니다.
@@ -75,7 +137,7 @@ mission_driver:
     start_escape_linear_x: 0.10
     start_escape_angular_z: 0.0
     start_escape_duration_sec: 2.0
-    start_escape_stop_sec: 0.5
+    start_escape_stop_sec: 1.0
 
     stop_zero_seconds: 1.5
     action_server_timeout: 10.0
@@ -95,6 +157,14 @@ mission_driver:
     docking_remote_command: "ros2 run docking dock_turn_backup"
     docking_timeout_sec: 120.0
     docking_stop_grace_sec: 3.0
+
+    # 실제 START/HOME 도킹 성공 후 SSH 사용자의 ~/capture/ 전체를 가져옵니다.
+    # 위 docking_ssh_* 설정을 재사용합니다. 서버 전용 파일은 삭제하지 않습니다.
+    capture_sync_enabled: true
+    capture_sync_local_directory: "~/capture"
+    capture_sync_timeout_sec: 1800.0
+    capture_sync_attempts: 3
+    capture_sync_retry_delay_sec: 10.0
 
     supervisor_service_timeout_sec: 30.0
     costmap_service_timeout_sec: 5.0

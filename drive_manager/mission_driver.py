@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
 
+import copy
 import json
 import math
 import os
 import queue
+import re
 import shlex
 import signal
 import subprocess
 import threading
 import time
+import uuid
 
 from action_msgs.msg import GoalStatus
+from ament_index_python.packages import get_package_share_directory
+from drive_manager.capture_sync import CaptureSync, build_sync_command
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
-from nav2_msgs.action import NavigateToPose
+from inspection_interfaces.msg import CaptureZone
+from inspection_interfaces.srv import (
+    AbortCaptureRun,
+    CapturePair,
+    FinishCaptureRun,
+    StartCaptureRun,
+)
+from nav2_msgs.action import NavigateToPose, Spin
 from nav2_msgs.srv import ClearEntireCostmap
 from nav_msgs.msg import Odometry
 import rclpy
@@ -43,6 +55,119 @@ def yaw_to_quaternion(yaw):
     return qz, qw
 
 
+def quaternion_to_yaw(quaternion):
+    siny_cosp = 2.0 * (
+        quaternion.w * quaternion.z + quaternion.x * quaternion.y
+    )
+    cosy_cosp = 1.0 - 2.0 * (
+        quaternion.y * quaternion.y + quaternion.z * quaternion.z
+    )
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def make_capture_zone(name, coordinates):
+    """Build a rectangle from two opposite map-frame corner points."""
+    try:
+        values = [float(value) for value in coordinates]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("coordinates must be numeric") from exc
+
+    if len(values) != 4:
+        raise ValueError("zone must contain two map points [x1, y1, x2, y2]")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("coordinates must be finite")
+
+    x1, y1, x2, y2 = values
+    min_x, max_x = sorted((x1, x2))
+    min_y, max_y = sorted((y1, y2))
+    if min_x == max_x or min_y == max_y:
+        raise ValueError("two points must define a rectangle with non-zero area")
+
+    return {
+        "name": str(name),
+        "min_x": min_x,
+        "min_y": min_y,
+        "max_x": max_x,
+        "max_y": max_y,
+    }
+
+
+def point_is_in_capture_zone(x, y, zone):
+    """Return True when a map point is inside or on the rectangle boundary."""
+    x = float(x)
+    y = float(y)
+    return (
+        zone["min_x"] <= x <= zone["max_x"]
+        and zone["min_y"] <= y <= zone["max_y"]
+    )
+
+
+def find_capture_zone(x, y, zones):
+    """Return the first configured zone containing a map point."""
+    for zone in zones:
+        if point_is_in_capture_zone(x, y, zone):
+            return zone
+    return None
+
+
+def capture_distance_reached(x, y, last_position, minimum_distance):
+    """Return True for the first capture or after enough map-frame movement."""
+    if last_position is None:
+        return True
+    distance = math.hypot(
+        float(x) - last_position[0],
+        float(y) - last_position[1],
+    )
+    minimum_distance = float(minimum_distance)
+    return distance >= minimum_distance or math.isclose(
+        distance,
+        minimum_distance,
+        abs_tol=1e-9,
+    )
+
+
+def robot_motion_allows_capture(
+    linear_speed,
+    angular_speed,
+    minimum_linear_speed,
+    maximum_angular_speed,
+):
+    """Allow capture triggers during translation, not in-place yaw alignment."""
+    if linear_speed is None or angular_speed is None:
+        return False
+    values = (
+        linear_speed,
+        angular_speed,
+        minimum_linear_speed,
+        maximum_angular_speed,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        return False
+    return (
+        float(linear_speed) >= float(minimum_linear_speed)
+        and float(angular_speed) <= float(maximum_angular_speed)
+    )
+
+
+def normalize_capture_zone_names(zone_names):
+    """Validate ordered, unique zone IDs suitable for ROS parameter names."""
+    normalized = []
+    seen = set()
+    for raw_name in zone_names:
+        name = str(raw_name).strip()
+        if not name:
+            raise ValueError("capture zone names must not be empty")
+        if re.fullmatch(r"[A-Za-z0-9_-]+", name) is None:
+            raise ValueError(
+                f"invalid capture zone name {name!r}; use letters, numbers, _ or -"
+            )
+        if name in seen:
+            raise ValueError(f"duplicate capture zone name: {name}")
+        normalized.append(name)
+        seen.add(name)
+    return normalized
+
+
 class MissionDriver(Node):
     """Executes navigation missions received from command_manager."""
 
@@ -61,6 +186,17 @@ class MissionDriver(Node):
         self.declare_parameter_if_missing("route_points_publish_period_sec", 1.0)
         self.declare_parameter_if_missing("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter_if_missing("navigate_action", "/navigate_to_pose")
+        self.declare_parameter_if_missing("home_spin_action", "/spin")
+        self.declare_parameter_if_missing(
+            "home_behavior_tree",
+            os.path.join(get_package_share_directory("drive_manager"),
+                         "behavior_trees", "navigate_home.xml"),
+        )
+        self.declare_parameter_if_missing("home_arrival_xy_tolerance_m", 0.15)
+        self.declare_parameter_if_missing("home_alignment_yaw_tolerance_rad", 0.0524)
+        self.declare_parameter_if_missing("home_alignment_max_attempts", 3)
+        self.declare_parameter_if_missing("home_alignment_timeout_sec", 15.0)
+        self.declare_parameter_if_missing("home_pose_max_age_sec", 0.5)
         self.declare_parameter_if_missing("ensure_nav2_active", True)
         self.declare_parameter_if_missing(
             "start_localization_on_startup",
@@ -81,6 +217,40 @@ class MissionDriver(Node):
         self.declare_parameter_if_missing("robot_pose_topic", "/robot_pose")
         self.declare_parameter_if_missing("robot_pose_status_topic", "/robot_pose_status")
         self.declare_parameter_if_missing("web_teleop_active_topic", "/web_teleop/active")
+        self.declare_parameter_if_missing("capture_enabled", False)
+        self.declare_parameter_if_missing("capture_required", True)
+        self.declare_parameter_if_missing("capture_zone_names", ["A", "B"])
+        self.declare_parameter_if_missing("capture_min_distance_m", 1.0)
+        self.declare_parameter_if_missing("capture_trigger_min_linear_mps", 0.02)
+        self.declare_parameter_if_missing("capture_trigger_max_angular_rps", 0.15)
+        self.declare_parameter_if_missing("capture_goal_exclusion_radius_m", 0.30)
+        self.declare_parameter_if_missing("capture_stop_settle_sec", 0.7)
+        self.declare_parameter_if_missing("capture_stop_timeout_sec", 3.0)
+        self.declare_parameter_if_missing("capture_stopped_linear_mps", 0.02)
+        self.declare_parameter_if_missing("capture_stopped_angular_rps", 0.05)
+        self.declare_parameter_if_missing("capture_pose_timeout_sec", 2.0)
+        # RTSP capture can take up to about 30 seconds when a stream is unhealthy.
+        self.declare_parameter_if_missing("capture_service_timeout_sec", 35.0)
+        self.declare_parameter_if_missing("capture_finish_wait_timeout_sec", 40.0)
+        self.declare_parameter_if_missing("capture_failure_stops_mission", False)
+        self.declare_parameter_if_missing("capture_map_id", "map_0903")
+        self.declare_parameter_if_missing("capture_zone_revision", "yaml_v1")
+        self.declare_parameter_if_missing(
+            "capture_run_start_service",
+            "/camera/capture_run/start",
+        )
+        self.declare_parameter_if_missing(
+            "capture_pair_service",
+            "/camera/capture_pair",
+        )
+        self.declare_parameter_if_missing(
+            "capture_run_finish_service",
+            "/camera/capture_run/finish",
+        )
+        self.declare_parameter_if_missing(
+            "capture_run_abort_service",
+            "/camera/capture_run/abort",
+        )
         self.declare_parameter_if_missing("odom_frame", "odom")
         self.declare_parameter_if_missing("base_frame", "base_link")
         self.declare_parameter_if_missing("map_frame", "map")
@@ -140,6 +310,11 @@ class MissionDriver(Node):
         )
         self.declare_parameter_if_missing("docking_timeout_sec", 120.0)
         self.declare_parameter_if_missing("docking_stop_grace_sec", 3.0)
+        self.declare_parameter_if_missing("capture_sync_enabled", False)
+        self.declare_parameter_if_missing("capture_sync_local_directory", "~/capture")
+        self.declare_parameter_if_missing("capture_sync_timeout_sec", 1800.0)
+        self.declare_parameter_if_missing("capture_sync_attempts", 3)
+        self.declare_parameter_if_missing("capture_sync_retry_delay_sec", 10.0)
         self.declare_parameter_if_missing("supervisor_service_timeout_sec", 30.0)
         self.declare_parameter_if_missing("costmap_service_timeout_sec", 5.0)
 
@@ -152,6 +327,9 @@ class MissionDriver(Node):
             String,
             self.get_parameter("mission_status_topic").value,
             mission_status_qos,
+        )
+        self.capture_sync_status_pub = self.create_publisher(
+            String, "/capture_sync/status", mission_status_qos,
         )
         self.route_points_pub = self.create_publisher(
             String,
@@ -229,6 +407,9 @@ class MissionDriver(Node):
             NavigateToPose,
             self.get_parameter("navigate_action").value,
         )
+        self.home_spin_client = ActionClient(
+            self, Spin, self.get_parameter("home_spin_action").value,
+        )
         self.supervisor_clients = {
             "start_localization": self.create_client(
                 Trigger,
@@ -257,6 +438,24 @@ class MissionDriver(Node):
                 "/global_costmap/clear_entirely_global_costmap",
             ),
         ]
+        self.capture_clients = {
+            "start": self.create_client(
+                StartCaptureRun,
+                self.get_parameter("capture_run_start_service").value,
+            ),
+            "capture": self.create_client(
+                CapturePair,
+                self.get_parameter("capture_pair_service").value,
+            ),
+            "finish": self.create_client(
+                FinishCaptureRun,
+                self.get_parameter("capture_run_finish_service").value,
+            ),
+            "abort": self.create_client(
+                AbortCaptureRun,
+                self.get_parameter("capture_run_abort_service").value,
+            ),
+        }
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -265,15 +464,20 @@ class MissionDriver(Node):
         self.shutdown_event = threading.Event()
         self.state_lock = threading.Lock()
         self.sensor_lock = threading.Lock()
+        self.capture_lock = threading.Lock()
         self.active_goal_handle = None
         self.active_goal_label = None
+        self.active_goal_distance_remaining = None
         self.mission_active = False
         self.manual_initial_pose_pending = False
+        self.manual_initial_pose = None
         self.interrupt_reason = None
         self.estop_latched = False
         self.zero_until_time = 0.0
         self.last_feedback_time = 0.0
         self.last_odom_received = None
+        self.last_odom_linear_speed = None
+        self.last_odom_angular_speed = None
         self.last_scan_received = None
         self.last_scan_frame = None
         self.last_amcl_received = None
@@ -284,9 +488,29 @@ class MissionDriver(Node):
         self.robot_was_ready = False
         self.robot_loss_handling = False
         self.web_teleop_active = False
+        self.active_mission_command = None
+        self.invalid_capture_zones = []
+        self.capture_zones = self.get_capture_zones()
+        self.capture_min_distance_m = max(
+            0.01,
+            float(self.get_parameter("capture_min_distance_m").value),
+        )
+        self.current_capture_zone = None
+        self.last_capture_position = None
+        self.capture_run_active = False
+        self.capture_accepting_requests = False
+        self.capture_in_progress = False
+        self.capture_stop_requested = False
+        self.capture_stop_active = False
+        self.capture_stop_zone = None
+        self.capture_run_id = ""
+        self.capture_mission_id = ""
+        self.capture_request_sequence = 0
+        self.last_capture_directory = ""
 
         self.zero_timer = self.create_timer(0.1, self.zero_timer_callback)
         self.robot_health_timer = self.create_timer(0.5, self.robot_health_callback)
+        self.capture_timer = self.create_timer(0.1, self.capture_timer_callback)
         route_points_period_sec = max(
             0.1,
             float(self.get_parameter("route_points_publish_period_sec").value),
@@ -295,6 +519,7 @@ class MissionDriver(Node):
             route_points_period_sec,
             self.publish_route_points,
         )
+        self.capture_sync = CaptureSync(self.report_capture_sync)
         self.worker = threading.Thread(target=self.worker_loop, daemon=True)
         self.worker.start()
 
@@ -312,15 +537,25 @@ class MissionDriver(Node):
         self.get_logger().info(
             f"Mission driver ready on {self.get_parameter('mission_command_topic').value}"
         )
+        if bool(self.get_parameter("capture_enabled").value):
+            self.get_logger().info(
+                "Zone capture enabled: "
+                f"{len(self.capture_zones)} zone(s), "
+                f"distance={self.capture_min_distance_m:.2f}m, "
+                f"service={self.get_parameter('capture_pair_service').value}"
+            )
 
     def declare_parameter_if_missing(self, name, default_value):
         if not self.has_parameter(name):
             self.declare_parameter(name, default_value)
 
     def odom_callback(self, msg):
-        del msg
+        linear = msg.twist.twist.linear
+        angular = msg.twist.twist.angular
         with self.sensor_lock:
             self.last_odom_received = time.monotonic()
+            self.last_odom_linear_speed = math.hypot(linear.x, linear.y)
+            self.last_odom_angular_speed = abs(angular.z)
 
     def scan_callback(self, msg):
         with self.sensor_lock:
@@ -347,6 +582,13 @@ class MissionDriver(Node):
         ):
             return
 
+        position = msg.pose.pose.position
+        yaw = quaternion_to_yaw(msg.pose.pose.orientation)
+        initial_pose = (float(position.x), float(position.y), float(yaw))
+        if not all(math.isfinite(value) for value in initial_pose):
+            self.get_logger().warn("Ignoring non-finite manual initial pose")
+            return
+
         with self.state_lock:
             if (
                 self.mission_active
@@ -359,11 +601,12 @@ class MissionDriver(Node):
                 )
                 return
             self.manual_initial_pose_pending = True
+            self.manual_initial_pose = initial_pose
 
-        position = msg.pose.pose.position
         self.get_logger().info(
             "Queued manual initial pose: "
-            f"x={position.x:.3f}, y={position.y:.3f}"
+            f"x={initial_pose[0]:.3f}, y={initial_pose[1]:.3f}, "
+            f"yaw={initial_pose[2]:.3f}"
         )
         self.command_queue.put(self.MANUAL_INITIAL_POSE_COMMAND)
 
@@ -435,6 +678,7 @@ class MissionDriver(Node):
             try:
                 if tracks_mission_state:
                     self.set_mission_active(True)
+                    self.set_active_mission_command(command)
                 if command == "START":
                     self.handle_start()
                 elif command == "HOME":
@@ -447,10 +691,14 @@ class MissionDriver(Node):
                 self.publish_status(f"ERROR {command}")
                 self.get_logger().error(f"Failed to handle {command}: {exc}")
             finally:
+                if command == "START" and self.is_capture_run_active():
+                    self.abort_capture_run(self.get_capture_abort_reason())
                 if command == self.MANUAL_INITIAL_POSE_COMMAND:
                     self.set_manual_initial_pose_pending(False)
                 if tracks_mission_state:
+                    self.set_active_mission_command(None)
                     self.set_mission_active(False)
+                    self.reset_capture_tracking()
                 self.command_queue.task_done()
 
     def handle_startup_localization(self):
@@ -465,11 +713,18 @@ class MissionDriver(Node):
 
     def handle_manual_initial_pose(self):
         self.publish_status("MANUAL_INITIAL_POSE_RECEIVED")
+        with self.state_lock:
+            initial_pose = self.manual_initial_pose
+
+        if initial_pose is None:
+            self.publish_status("ERROR invalid_manual_initial_pose")
+            return
+
         if not self.wait_for_robot_ready():
             self.publish_status("ERROR robot_not_ready")
             return
 
-        if not self.prepare_navigation():
+        if not self.prepare_navigation(initial_pose=initial_pose):
             self.publish_status("ERROR manual_nav2_not_ready")
             return
 
@@ -510,6 +765,16 @@ class MissionDriver(Node):
             self.publish_status("ERROR nav2_not_ready")
             return
 
+        camera_started = self.start_capture_run()
+        if (
+            bool(self.get_parameter("capture_enabled").value)
+            and not camera_started
+            and bool(self.get_parameter("capture_required").value)
+        ):
+            self.publish_status("ERROR camera_run_start_failed")
+            self.publish_command_result("START", False)
+            return
+
         self.log_start_mission(home_to_patrol_pose, patrol_points, home_to_dock_pose)
 
         if bool(self.get_parameter("navigate_to_home_to_patrol_pose").value):
@@ -535,6 +800,15 @@ class MissionDriver(Node):
         if not self.navigate_or_abort("START", "HOME_TO_DOCK", *home_to_dock_pose):
             return
 
+        camera_ok = self.finish_capture_run()
+        if not camera_ok:
+            self.publish_status("ERROR camera_run_finish_failed")
+            if self.is_capture_run_active():
+                self.abort_capture_run("finish_failed")
+
+        if not self.align_home_or_abort("START", home_to_dock_pose):
+            return
+
         if not self.pause_navigation():
             self.publish_status("ERROR nav2_pause_before_docking_failed")
             return
@@ -544,16 +818,11 @@ class MissionDriver(Node):
             return
 
         self.finalize_docked_state()
-        self.publish_command_result("START", True)
+        camera_required = bool(self.get_parameter("capture_required").value)
+        self.publish_command_result("START", not camera_required or camera_ok)
 
     def handle_home(self):
         self.publish_status("RETURNING_HOME")
-        with self.sensor_lock:
-            already_docked = self.pose_mode == "DOCKED" and not self.nav2_expected_active
-        if already_docked:
-            self.publish_command_result("HOME", True)
-            return
-
         if not self.wait_for_robot_ready():
             self.publish_status("ERROR robot_not_ready")
             return
@@ -568,6 +837,9 @@ class MissionDriver(Node):
             return
 
         if not self.navigate_or_abort("HOME", "HOME_TO_DOCK", *home_to_dock_pose):
+            return
+
+        if not self.align_home_or_abort("HOME", home_to_dock_pose):
             return
 
         if not self.pause_navigation():
@@ -594,6 +866,131 @@ class MissionDriver(Node):
             return False
 
         return True
+
+    def align_home_or_abort(self, command, target_pose):
+        self.publish_status("HOME_ALIGNING")
+        if self.align_home_heading(target_pose):
+            return True
+        self.publish_zero_velocity()
+        self.publish_status("ERROR home_alignment_failed")
+        self.publish_command_result(command, False)
+        return False
+
+    def get_home_pose_error(self, target_pose):
+        """Use fresh map->base TF, never the fixed pose published for the web."""
+        transform = self.tf_buffer.lookup_transform(
+            str(self.get_parameter("map_frame").value),
+            str(self.get_parameter("base_frame").value),
+            Time(), timeout=Duration(seconds=0.2),
+        )
+        age = (self.get_clock().now().nanoseconds -
+               Time.from_msg(transform.header.stamp).nanoseconds) / 1e9
+        max_age = float(self.get_parameter("home_pose_max_age_sec").value)
+        if not math.isfinite(max_age) or max_age <= 0 or not 0 <= age <= max_age:
+            raise ValueError(f"HOME pose TF is stale or future-dated: age={age:.3f}s")
+        position = transform.transform.translation
+        yaw = quaternion_to_yaw(transform.transform.rotation)
+        distance = math.hypot(target_pose[0] - position.x, target_pose[1] - position.y)
+        yaw_error = math.atan2(math.sin(target_pose[2] - yaw),
+                               math.cos(target_pose[2] - yaw))
+        if not all(math.isfinite(value) for value in (distance, yaw_error)):
+            raise ValueError("HOME pose error is not finite")
+        return distance, yaw_error
+
+    def align_home_heading(self, target_pose):
+        xy_limit = float(self.get_parameter("home_arrival_xy_tolerance_m").value)
+        yaw_limit = float(self.get_parameter("home_alignment_yaw_tolerance_rad").value)
+        attempts = int(self.get_parameter("home_alignment_max_attempts").value)
+        if (not all(math.isfinite(v) and v > 0 for v in (xy_limit, yaw_limit))
+                or attempts < 1):
+            self.get_logger().error("Invalid HOME alignment tolerances or attempts")
+            return False
+        for attempt in range(attempts + 1):
+            if self.shutdown_event.is_set() or self.has_interrupt_reason():
+                return False
+            if not self.wait_until_robot_stopped():
+                self.get_logger().error("HOME alignment could not confirm stopped odometry")
+                return False
+            try:
+                distance, yaw_error = self.get_home_pose_error(target_pose)
+            except (TransformException, ValueError) as exc:
+                self.get_logger().error(f"HOME alignment pose unavailable: {exc}")
+                return False
+            self.get_logger().info(
+                f"HOME alignment check {attempt}: xy_error={distance:.3f}m, "
+                f"yaw_error={math.degrees(yaw_error):.2f}deg"
+            )
+            if distance > xy_limit:
+                self.get_logger().error("HOME position outside docking handoff tolerance")
+                return False
+            if abs(yaw_error) <= yaw_limit:
+                return not self.has_interrupt_reason() and not self.shutdown_event.is_set()
+            if attempt == attempts or not self.spin_home_heading(yaw_error):
+                return False
+        return False
+
+    def spin_home_heading(self, yaw_error):
+        """Correct the shortest yaw error through Nav2's collision-checked Spin."""
+        server_timeout = float(self.get_parameter("action_server_timeout").value)
+        timeout = float(self.get_parameter("home_alignment_timeout_sec").value)
+        if not math.isfinite(timeout) or timeout <= 0:
+            self.get_logger().error("Invalid HOME alignment timeout")
+            return False
+        if not self.home_spin_client.wait_for_server(timeout_sec=server_timeout):
+            self.get_logger().error("HOME alignment Spin action server unavailable")
+            return False
+        if self.has_interrupt_reason() or self.shutdown_event.is_set():
+            return False
+        goal = Spin.Goal()
+        goal.target_yaw = float(yaw_error)
+        goal.time_allowance = Duration(seconds=timeout).to_msg()
+        send_future = self.home_spin_client.send_goal_async(goal)
+        handle = self.wait_for_future(send_future, server_timeout)
+        if handle is None:
+            # A late acceptance must not start an untracked rotation.
+            def cancel_late_goal(future):
+                try:
+                    late_handle = future.result()
+                    if late_handle is not None and late_handle.accepted:
+                        late_handle.cancel_goal_async()
+                except Exception as exc:
+                    self.get_logger().error(f"Failed to cancel late HOME spin: {exc}")
+            send_future.add_done_callback(cancel_late_goal)
+            self.get_logger().error("HOME alignment Spin goal send timed out")
+            return False
+        if not handle.accepted:
+            self.get_logger().error("HOME alignment Spin goal rejected")
+            return False
+        with self.state_lock:
+            self.active_goal_handle = handle
+            self.active_goal_label = "HOME_ALIGN"
+        response = None
+        try:
+            if self.has_interrupt_reason() or self.shutdown_event.is_set():
+                return False
+            response = self.wait_for_future(
+                handle.get_result_async(), timeout + 2.0, abort_on_interrupt=True,
+            )
+            if response is None:
+                self.get_logger().error("HOME alignment Spin interrupted or timed out")
+                return False
+            if response.status != GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().error(
+                    f"HOME alignment Spin failed: status={response.status}, "
+                    f"error_code={response.result.error_code}"
+                )
+                return False
+            return True
+        finally:
+            try:
+                if response is None:
+                    self.wait_for_future(handle.cancel_goal_async(), server_timeout)
+            finally:
+                with self.state_lock:
+                    if self.active_goal_handle == handle:
+                        self.active_goal_handle = None
+                        self.active_goal_label = None
+                self.publish_zero_velocity()
 
     def run_start_escape(self):
         if not bool(self.get_parameter("start_escape_enabled").value):
@@ -646,6 +1043,545 @@ class MissionDriver(Node):
                 return None
             points.append((point_name, xy[0], xy[1]))
         return points
+
+    def get_capture_zones(self):
+        zones = []
+        invalid_zones = []
+        capture_enabled = bool(self.get_parameter("capture_enabled").value)
+        try:
+            zone_names = normalize_capture_zone_names(
+                list(self.get_parameter("capture_zone_names").value)
+            )
+        except (TypeError, ValueError) as exc:
+            self.invalid_capture_zones = ["capture_zone_names"]
+            self.get_logger().error(f"Invalid capture_zone_names: {exc}")
+            return zones
+
+        for zone_name in zone_names:
+            parameter_name = f"capture_zones.{zone_name}"
+            if not self.has_parameter(parameter_name):
+                self.declare_parameter(parameter_name, [0.0, 0.0, 0.0, 0.0])
+            coordinates = self.get_parameter(parameter_name).value
+            try:
+                zones.append(make_capture_zone(zone_name, coordinates))
+            except ValueError as exc:
+                invalid_zones.append(zone_name)
+                self.get_logger().error(
+                    f"Invalid {parameter_name}: {exc}; got {coordinates}"
+                )
+
+        self.invalid_capture_zones = invalid_zones
+        if capture_enabled and not zones:
+            self.get_logger().info(
+                "No capture zones are active; this mission will run without photos"
+            )
+        return zones
+
+    def start_capture_run(self):
+        if not bool(self.get_parameter("capture_enabled").value):
+            return True
+        if self.is_capture_run_active() and not self.abort_capture_run(
+            "stale_run_before_start"
+        ):
+            self.get_logger().error(
+                "Cannot start a camera run while the previous run is unresolved"
+            )
+            return False
+        if self.invalid_capture_zones:
+            self.get_logger().error(
+                "Camera run has invalid non-empty zones: "
+                + ", ".join(self.invalid_capture_zones)
+            )
+            return False
+        if not self.capture_zones:
+            self.get_logger().info("Skipping camera run because no zones are active")
+            return True
+
+        request = StartCaptureRun.Request()
+        request.mission_id = f"mission_{uuid.uuid4().hex}"
+        request.map_id = str(self.get_parameter("capture_map_id").value)
+        request.map_frame = str(self.get_parameter("map_frame").value)
+        request.zone_revision = str(
+            self.get_parameter("capture_zone_revision").value
+        )
+        request.zones = []
+        for zone in self.capture_zones:
+            zone_msg = CaptureZone()
+            zone_msg.id = zone["name"]
+            zone_msg.min_x = zone["min_x"]
+            zone_msg.min_y = zone["min_y"]
+            zone_msg.max_x = zone["max_x"]
+            zone_msg.max_y = zone["max_y"]
+            request.zones.append(zone_msg)
+
+        response = self.call_capture_service("start", request)
+        if response is None or not response.success or not response.run_id:
+            message = "no response" if response is None else response.message
+            self.get_logger().error(f"Camera run start failed: {message}")
+            return False
+
+        with self.capture_lock:
+            self.capture_run_active = True
+            self.capture_accepting_requests = True
+            self.capture_in_progress = False
+            self.capture_run_id = response.run_id
+            self.capture_mission_id = request.mission_id
+            self.capture_request_sequence = 0
+            self.current_capture_zone = None
+            self.last_capture_position = None
+            self.capture_stop_requested = False
+            self.capture_stop_active = False
+            self.capture_stop_zone = None
+
+        self.get_logger().info(
+            f"Camera run started: mission_id={request.mission_id}, "
+            f"run_id={response.run_id}"
+        )
+        return True
+
+    def finish_capture_run(self):
+        if not bool(self.get_parameter("capture_enabled").value):
+            return True
+
+        with self.capture_lock:
+            if not self.capture_run_active:
+                return True
+            self.capture_accepting_requests = False
+            run_id = self.capture_run_id
+            mission_id = self.capture_mission_id
+
+        if not self.wait_for_capture_idle():
+            self.get_logger().error(
+                f"Timed out waiting for the last capture in {run_id}"
+            )
+            return False
+
+        request = FinishCaptureRun.Request()
+        request.run_id = run_id
+        request.mission_id = mission_id
+        response = self.call_capture_service("finish", request)
+        if (
+            response is None
+            or not response.success
+            or not response.ready
+            or response.run_id != run_id
+        ):
+            message = "no response" if response is None else response.message
+            self.get_logger().error(f"Camera run finish failed: {message}")
+            return False
+
+        with self.capture_lock:
+            self.last_capture_directory = response.directory
+            self.clear_capture_run_state_locked()
+
+        self.get_logger().info(
+            f"Camera run ready: run_id={run_id}, directory={response.directory}"
+        )
+        return True
+
+    def abort_capture_run(self, reason):
+        with self.capture_lock:
+            if not self.capture_run_active:
+                return True
+            self.capture_accepting_requests = False
+            run_id = self.capture_run_id
+            mission_id = self.capture_mission_id
+
+        self.wait_for_capture_idle()
+        request = AbortCaptureRun.Request()
+        request.run_id = run_id
+        request.mission_id = mission_id
+        request.reason = str(reason)
+        response = self.call_capture_service("abort", request)
+        success = (
+            response is not None
+            and response.success
+            and response.run_id == run_id
+        )
+        if success:
+            self.get_logger().info(
+                f"Camera run aborted: run_id={run_id}, reason={reason}"
+            )
+        else:
+            message = "no response" if response is None else response.message
+            self.get_logger().error(f"Camera run abort failed: {message}")
+
+        if success:
+            with self.capture_lock:
+                self.clear_capture_run_state_locked()
+        return success
+
+    def call_capture_service(self, operation, request):
+        timeout = float(self.get_parameter("capture_service_timeout_sec").value)
+        return self.call_service(
+            self.capture_clients[operation],
+            request,
+            timeout_sec=timeout,
+        )
+
+    def wait_for_capture_idle(self):
+        timeout = max(
+            0.0,
+            float(self.get_parameter("capture_finish_wait_timeout_sec").value),
+        )
+        deadline = time.monotonic() + timeout
+        while not self.shutdown_event.is_set():
+            with self.capture_lock:
+                if not self.capture_in_progress:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return False
+
+    def is_capture_run_active(self):
+        with self.capture_lock:
+            return self.capture_run_active
+
+    def get_capture_abort_reason(self):
+        with self.state_lock:
+            return self.interrupt_reason or "mission_incomplete"
+
+    def clear_capture_run_state_locked(self):
+        self.capture_run_active = False
+        self.capture_accepting_requests = False
+        self.capture_in_progress = False
+        self.capture_run_id = ""
+        self.capture_mission_id = ""
+        self.capture_request_sequence = 0
+        self.current_capture_zone = None
+        self.last_capture_position = None
+        self.capture_stop_requested = False
+        self.capture_stop_active = False
+        self.capture_stop_zone = None
+
+    def capture_timer_callback(self, now_monotonic=None):
+        if not bool(self.get_parameter("capture_enabled").value):
+            self.reset_capture_tracking()
+            return
+
+        with self.state_lock:
+            capture_mission_active = (
+                self.mission_active
+                and self.active_mission_command == "START"
+                and self.interrupt_reason is None
+            )
+            active_goal_label = self.active_goal_label
+            goal_distance_remaining = self.active_goal_distance_remaining
+        if not capture_mission_active:
+            self.reset_capture_tracking()
+            return
+        if active_goal_label == "HOME_TO_DOCK":
+            return
+        goal_exclusion_radius = max(
+            0.0,
+            float(self.get_parameter("capture_goal_exclusion_radius_m").value),
+        )
+        if (
+            goal_distance_remaining is not None
+            and math.isfinite(goal_distance_remaining)
+            and goal_distance_remaining <= goal_exclusion_radius
+        ):
+            return
+
+        now_monotonic = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        with self.sensor_lock:
+            nav2_expected_active = self.nav2_expected_active
+            pose_mode = self.pose_mode
+            amcl_received = self.last_amcl_received
+            amcl_pose = self.last_amcl_pose
+            odom_received = self.last_odom_received
+            linear_speed = self.last_odom_linear_speed
+            angular_speed = self.last_odom_angular_speed
+
+        pose_timeout = max(
+            0.0,
+            float(self.get_parameter("capture_pose_timeout_sec").value),
+        )
+        if (
+            not nav2_expected_active
+            or pose_mode != "AMCL"
+            or amcl_pose is None
+            or amcl_received is None
+            or now_monotonic - amcl_received > pose_timeout
+        ):
+            self.reset_capture_tracking()
+            return
+
+        odom_timeout = max(
+            0.0,
+            float(self.get_parameter("robot_message_timeout_sec").value),
+        )
+        if (
+            odom_received is None
+            or now_monotonic - odom_received > odom_timeout
+            or not robot_motion_allows_capture(
+                linear_speed,
+                angular_speed,
+                self.get_parameter("capture_trigger_min_linear_mps").value,
+                self.get_parameter("capture_trigger_max_angular_rps").value,
+            )
+        ):
+            return
+
+        position = amcl_pose.pose.pose.position
+        x = float(position.x)
+        y = float(position.y)
+        if not math.isfinite(x) or not math.isfinite(y):
+            self.reset_capture_tracking()
+            return
+
+        zone = find_capture_zone(x, y, self.capture_zones)
+        zone_name = None if zone is None else zone["name"]
+        with self.capture_lock:
+            previous_zone = self.current_capture_zone
+            if zone_name != previous_zone:
+                self.current_capture_zone = zone_name
+                self.last_capture_position = None
+        if zone_name != previous_zone:
+            if previous_zone is not None:
+                self.get_logger().info(
+                    f"Robot left capture zone: {previous_zone}"
+                )
+            if zone_name is not None:
+                self.get_logger().info(f"Robot entered capture zone: {zone_name}")
+
+        if zone is None:
+            return
+
+        # A moving NavigateToPose goal is canceled in a controlled way. The
+        # navigation worker captures while stationary and resends the same goal.
+        if not self.has_active_goal():
+            return
+
+        with self.capture_lock:
+            if (
+                not self.capture_run_active
+                or not self.capture_accepting_requests
+                or self.capture_in_progress
+            ):
+                return
+            if not capture_distance_reached(
+                x,
+                y,
+                self.last_capture_position,
+                self.capture_min_distance_m,
+            ):
+                return
+
+            self.capture_in_progress = True
+            self.capture_stop_requested = True
+            self.capture_stop_zone = zone_name
+
+        self.get_logger().info(
+            f"Requesting stopped capture: zone={zone_name}, x={x:.3f}, y={y:.3f}"
+        )
+        if not self.cancel_active_goal(context="zone capture"):
+            with self.capture_lock:
+                self.capture_in_progress = False
+                self.capture_stop_requested = False
+                self.capture_stop_zone = None
+            self.get_logger().warn("Could not pause the active goal for zone capture")
+
+    def perform_stopped_capture(self):
+        with self.capture_lock:
+            if not self.capture_stop_requested:
+                return False
+            expected_zone = self.capture_stop_zone
+            self.capture_stop_requested = False
+            self.capture_stop_active = True
+
+        try:
+            self.publish_status(f"CAPTURE_STOPPING zone={expected_zone}")
+            if not self.wait_until_robot_stopped():
+                self.handle_capture_control_failure(
+                    expected_zone,
+                    "robot did not stop before the capture timeout",
+                )
+                return False
+
+            with self.sensor_lock:
+                amcl_pose = copy.deepcopy(self.last_amcl_pose)
+                amcl_received = self.last_amcl_received
+
+            now_monotonic = time.monotonic()
+            pose_timeout = max(
+                0.0,
+                float(self.get_parameter("capture_pose_timeout_sec").value),
+            )
+            if (
+                amcl_pose is None
+                or amcl_received is None
+                or now_monotonic - amcl_received > pose_timeout
+            ):
+                self.handle_capture_control_failure(
+                    expected_zone,
+                    "AMCL pose is unavailable after stopping",
+                )
+                return False
+
+            position = amcl_pose.pose.pose.position
+            x = float(position.x)
+            y = float(position.y)
+            zone = find_capture_zone(x, y, self.capture_zones)
+            actual_zone = None if zone is None else zone["name"]
+            if actual_zone != expected_zone:
+                self.get_logger().warn(
+                    "Skipping stopped capture because the robot left the zone while "
+                    f"braking: expected={expected_zone}, actual={actual_zone}"
+                )
+                return False
+
+            with self.capture_lock:
+                if not self.capture_run_active or not self.capture_accepting_requests:
+                    return False
+                self.capture_request_sequence += 1
+                request_id = (
+                    f"{self.capture_mission_id}_capture_"
+                    f"{self.capture_request_sequence:06d}"
+                )
+                run_id = self.capture_run_id
+                mission_id = self.capture_mission_id
+                # Count an attempted capture as this distance interval so a bad
+                # camera does not repeatedly stop the robot at the same position.
+                self.last_capture_position = (x, y)
+
+            request = CapturePair.Request()
+            request.run_id = run_id
+            request.mission_id = mission_id
+            request.request_id = request_id
+            request.zone_id = expected_zone
+            request.requested_at = self.get_clock().now().to_msg()
+            request.robot_pose = amcl_pose
+            self.publish_status(f"CAPTURING zone={expected_zone}")
+            return self.execute_capture_request(request)
+        finally:
+            with self.capture_lock:
+                self.capture_stop_active = False
+                self.capture_stop_requested = False
+                self.capture_stop_zone = None
+                self.capture_in_progress = False
+
+    def wait_until_robot_stopped(self):
+        settle_sec = max(
+            0.0,
+            float(self.get_parameter("capture_stop_settle_sec").value),
+        )
+        timeout_sec = max(
+            settle_sec,
+            float(self.get_parameter("capture_stop_timeout_sec").value),
+        )
+        linear_limit = max(
+            0.0,
+            float(self.get_parameter("capture_stopped_linear_mps").value),
+        )
+        angular_limit = max(
+            0.0,
+            float(self.get_parameter("capture_stopped_angular_rps").value),
+        )
+        odom_timeout = max(
+            0.0,
+            float(self.get_parameter("robot_message_timeout_sec").value),
+        )
+        deadline = time.monotonic() + timeout_sec
+        stopped_since = None
+
+        while not self.shutdown_event.is_set() and time.monotonic() < deadline:
+            if self.has_interrupt_reason():
+                return False
+            self.publish_zero_velocity()
+            now = time.monotonic()
+            with self.sensor_lock:
+                odom_received = self.last_odom_received
+                linear_speed = self.last_odom_linear_speed
+                angular_speed = self.last_odom_angular_speed
+
+            odom_fresh = (
+                odom_received is not None and now - odom_received <= odom_timeout
+            )
+            stopped = (
+                odom_fresh
+                and linear_speed is not None
+                and angular_speed is not None
+                and linear_speed <= linear_limit
+                and angular_speed <= angular_limit
+            )
+            if stopped:
+                if stopped_since is None:
+                    stopped_since = now
+                if now - stopped_since >= settle_sec:
+                    return True
+            else:
+                stopped_since = None
+            time.sleep(0.05)
+        return False
+
+    def handle_capture_control_failure(self, zone_id, message):
+        self.get_logger().error(f"Stopped capture failed: zone={zone_id}, error={message}")
+        if not bool(
+            self.get_parameter("capture_failure_stops_mission").value
+        ):
+            return
+        with self.state_lock:
+            if self.interrupt_reason is None:
+                self.interrupt_reason = "CAMERA_CAPTURE_FAILED"
+        self.publish_status("ERROR camera_capture_failed")
+
+    def execute_capture_request(self, request):
+        failure_message = None
+        try:
+            response = self.call_capture_service("capture", request)
+            if response is None:
+                failure_message = "no response"
+            elif not response.success:
+                failure_message = response.message or "capture failed"
+            elif response.run_id != request.run_id:
+                failure_message = "response run_id does not match request"
+            elif response.request_id != request.request_id:
+                failure_message = "response request_id does not match request"
+            else:
+                self.get_logger().info(
+                    "Capture saved: "
+                    f"run_id={response.run_id}, capture_id={response.capture_id}, "
+                    f"request_id={response.request_id}, zone={request.zone_id}"
+                )
+        except Exception as exc:
+            failure_message = str(exc)
+        finally:
+            try:
+                if failure_message is not None:
+                    self.handle_capture_failure(request, failure_message)
+            finally:
+                with self.capture_lock:
+                    self.capture_in_progress = False
+        return failure_message is None
+
+    def handle_capture_failure(self, request, message):
+        self.get_logger().error(
+            f"Capture failed: request_id={request.request_id}, "
+            f"zone={request.zone_id}, error={message}"
+        )
+        if not bool(
+            self.get_parameter("capture_failure_stops_mission").value
+        ):
+            return
+
+        with self.state_lock:
+            should_stop = (
+                self.mission_active
+                and self.active_mission_command == "START"
+                and self.interrupt_reason is None
+            )
+            if should_stop:
+                self.interrupt_reason = "CAMERA_CAPTURE_FAILED"
+        if should_stop:
+            self.cancel_active_goal()
+            self.publish_status("ERROR camera_capture_failed")
+
+    def reset_capture_tracking(self):
+        with self.capture_lock:
+            self.current_capture_zone = None
+            self.last_capture_position = None
 
     def get_pose3_parameter(self, name):
         if not self.has_parameter(name):
@@ -805,7 +1741,44 @@ class MissionDriver(Node):
             return True
 
         self.publish_status("DOCKING")
-        return self.run_docking_command(docking_command)
+        succeeded = self.run_docking_command(docking_command)
+        if succeeded:
+            self.start_capture_sync()
+        return succeeded
+
+    def start_capture_sync(self):
+        if not bool(self.get_parameter("capture_sync_enabled").value):
+            return
+        if self.shutdown_event.is_set():
+            return
+        try:
+            destination = os.path.expanduser(str(
+                self.get_parameter("capture_sync_local_directory").value
+            ))
+            command = build_sync_command(
+                str(self.get_parameter("docking_ssh_user").value).strip(),
+                str(self.get_parameter("docking_ssh_host").value).strip(),
+                int(self.get_parameter("docking_ssh_port").value),
+                str(self.get_parameter("docking_ssh_identity_file").value).strip(),
+                str(self.get_parameter("docking_ssh_strict_host_key_checking").value),
+                destination,
+            )
+            self.capture_sync.request(
+                command, destination,
+                float(self.get_parameter("capture_sync_timeout_sec").value),
+                int(self.get_parameter("capture_sync_attempts").value),
+                float(self.get_parameter("capture_sync_retry_delay_sec").value),
+            )
+        except (ValueError, OSError) as exc:
+            self.report_capture_sync("SYNC_FAILED", str(exc))
+
+    def report_capture_sync(self, status, detail):
+        msg = String()
+        msg.data = status
+        self.capture_sync_status_pub.publish(msg)
+        logger = self.get_logger()
+        log = logger.error if status == "SYNC_FAILED" else logger.info
+        log(f"Capture sync {status}: {detail}")
 
     def get_docking_command(self):
         docking_mode = str(self.get_parameter("docking_mode").value).strip().lower()
@@ -982,7 +1955,7 @@ class MissionDriver(Node):
         with self.sensor_lock:
             self.pose_mode = "LOCALIZING"
 
-        if force_relocalize:
+        if initial_pose is not None:
             self.publish_status("WAITING_FOR_LOCALIZATION")
             if not self.wait_for_localization(initial_pose):
                 self.get_logger().error("AMCL did not converge after the initial pose")
@@ -1277,66 +2250,103 @@ class MissionDriver(Node):
             self.get_logger().error("/navigate_to_pose action server not available")
             return False
 
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = self.make_pose_stamped(x, y, yaw)
+        while not self.shutdown_event.is_set():
+            goal_msg = NavigateToPose.Goal()
+            goal_msg.pose = self.make_pose_stamped(x, y, yaw)
+            if label == "HOME_TO_DOCK":
+                goal_msg.behavior_tree = str(self.get_parameter("home_behavior_tree").value)
+                if not goal_msg.behavior_tree or not os.path.isfile(goal_msg.behavior_tree):
+                    self.get_logger().error("HOME behavior tree file is unavailable")
+                    return False
 
-        send_future = self.nav_client.send_goal_async(
-            goal_msg,
-            feedback_callback=self.navigation_feedback_callback,
-        )
-        goal_handle = self.wait_for_future(send_future, timeout)
+            send_future = self.nav_client.send_goal_async(
+                goal_msg,
+                feedback_callback=self.navigation_feedback_callback,
+            )
+            goal_handle = self.wait_for_future(send_future, timeout)
 
-        if goal_handle is None:
-            self.get_logger().error(f"{label} goal send timed out")
+            if goal_handle is None:
+                self.get_logger().error(f"{label} goal send timed out")
+                return False
+            if not goal_handle.accepted:
+                self.get_logger().error(f"{label} goal rejected")
+                return False
+
+            with self.state_lock:
+                self.active_goal_handle = goal_handle
+                self.active_goal_label = label
+                self.active_goal_distance_remaining = None
+
+            result_future = goal_handle.get_result_async()
+            result_response = self.wait_for_future(
+                result_future,
+                None,
+                abort_on_interrupt=True,
+            )
+
+            with self.state_lock:
+                if self.active_goal_handle == goal_handle:
+                    self.active_goal_handle = None
+                    self.active_goal_label = None
+                    self.active_goal_distance_remaining = None
+
+            if result_response is None:
+                self.discard_capture_stop_request()
+                if self.has_interrupt_reason():
+                    self.get_logger().warn(
+                        f"{label} interrupted while waiting for result"
+                    )
+                else:
+                    self.get_logger().error(f"{label} result unavailable")
+                return False
+
+            status = result_response.status
+            with self.capture_lock:
+                capture_stop_requested = self.capture_stop_requested
+
+            if (
+                capture_stop_requested
+                and status
+                in (GoalStatus.STATUS_CANCELED, GoalStatus.STATUS_SUCCEEDED)
+                and not self.has_interrupt_reason()
+            ):
+                self.perform_stopped_capture()
+                if self.has_interrupt_reason() or self.shutdown_event.is_set():
+                    return False
+                if status == GoalStatus.STATUS_SUCCEEDED:
+                    self.get_logger().info(f"{label} succeeded")
+                    return True
+                self.publish_status(f"NAVIGATING {label}")
+                self.get_logger().info(
+                    f"Resuming {label} after stopped zone capture"
+                )
+                continue
+
+            self.discard_capture_stop_request()
+            result = result_response.result
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().info(f"{label} succeeded")
+                return True
+
+            if status == GoalStatus.STATUS_CANCELED:
+                self.get_logger().warn(f"{label} canceled")
+                return False
+
+            self.get_logger().error(
+                f"{label} failed with status={status}, "
+                f"error_code={result.error_code}, error_msg={result.error_msg}"
+            )
             return False
-        if not goal_handle.accepted:
-            self.get_logger().error(f"{label} goal rejected")
-            return False
 
-        with self.state_lock:
-            self.active_goal_handle = goal_handle
-            self.active_goal_label = label
-
-        result_future = goal_handle.get_result_async()
-        result_response = self.wait_for_future(
-            result_future,
-            None,
-            abort_on_interrupt=True,
-        )
-
-        with self.state_lock:
-            if self.active_goal_handle == goal_handle:
-                self.active_goal_handle = None
-                self.active_goal_label = None
-
-        if result_response is None:
-            if self.has_interrupt_reason():
-                self.get_logger().warn(f"{label} interrupted while waiting for result")
-            else:
-                self.get_logger().error(f"{label} result unavailable")
-            return False
-
-        status = result_response.status
-        result = result_response.result
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info(f"{label} succeeded")
-            return True
-
-        if status == GoalStatus.STATUS_CANCELED:
-            self.get_logger().warn(f"{label} canceled")
-            return False
-
-        self.get_logger().error(
-            f"{label} failed with status={status}, "
-            f"error_code={result.error_code}, error_msg={result.error_msg}"
-        )
         return False
 
     def navigation_feedback_callback(self, feedback_msg):
+        distance = float(feedback_msg.feedback.distance_remaining)
+        with self.state_lock:
+            self.active_goal_distance_remaining = distance
         now = time.time()
         if now - self.last_feedback_time < 1.0:
             return
-        distance = feedback_msg.feedback.distance_remaining
         self.get_logger().info(f"Navigation remaining distance: {distance:.2f} m")
         self.last_feedback_time = now
 
@@ -1359,17 +2369,31 @@ class MissionDriver(Node):
         if nav2_expected_active and reason in ("STOP", "ESTOP"):
             threading.Thread(target=self.pause_navigation, daemon=True).start()
 
-    def cancel_active_goal(self):
+    def cancel_active_goal(self, context=None):
         with self.state_lock:
             goal_handle = self.active_goal_handle
             label = self.active_goal_label
 
         if goal_handle is None:
-            return
+            return False
 
-        self.get_logger().warn(f"Canceling active goal: {label}")
-        cancel_future = goal_handle.cancel_goal_async()
+        suffix = "" if context is None else f" ({context})"
+        self.get_logger().warn(f"Canceling active goal: {label}{suffix}")
+        try:
+            cancel_future = goal_handle.cancel_goal_async()
+        except Exception as exc:
+            self.get_logger().error(f"Failed to request goal cancellation: {exc}")
+            return False
         cancel_future.add_done_callback(self.cancel_done_callback)
+        return True
+
+    def discard_capture_stop_request(self):
+        with self.capture_lock:
+            if self.capture_stop_active:
+                return
+            self.capture_stop_requested = False
+            self.capture_stop_zone = None
+            self.capture_in_progress = False
 
     def cancel_done_callback(self, future):
         try:
@@ -1397,9 +2421,15 @@ class MissionDriver(Node):
         with self.state_lock:
             self.mission_active = active
 
+    def set_active_mission_command(self, command):
+        with self.state_lock:
+            self.active_mission_command = command
+
     def set_manual_initial_pose_pending(self, pending):
         with self.state_lock:
             self.manual_initial_pose_pending = pending
+            if not pending:
+                self.manual_initial_pose = None
 
     def set_interrupt_reason(self, reason):
         with self.state_lock:
@@ -1443,7 +2473,9 @@ class MissionDriver(Node):
         return False
 
     def zero_timer_callback(self):
-        if time.time() < self.zero_until_time:
+        with self.capture_lock:
+            capture_stop_active = self.capture_stop_active
+        if time.time() < self.zero_until_time or capture_stop_active:
             self.publish_zero_velocity()
 
     def publish_zero_velocity(self):
@@ -1498,6 +2530,7 @@ class MissionDriver(Node):
 
     def destroy_node(self):
         self.shutdown_event.set()
+        self.capture_sync.close()
         if self.worker.is_alive():
             self.worker.join(timeout=1.0)
         super().destroy_node()

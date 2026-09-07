@@ -40,6 +40,7 @@ def mission_status_forces_safe(status):
         "RETURNING_HOME",
         "RETURNING_HOME_REQUESTED",
         "DOCKING",
+        "HOME_ALIGNING",
         "DOCKED_NAV2_INACTIVE",
         "RESETTING_NAV2",
         "STARTING_LOCALIZATION",

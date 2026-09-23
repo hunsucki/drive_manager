@@ -312,6 +312,7 @@ class MissionDriver(Node):
         self.declare_parameter_if_missing("docking_stop_grace_sec", 3.0)
         self.declare_parameter_if_missing("capture_sync_enabled", False)
         self.declare_parameter_if_missing("capture_sync_local_directory", "~/capture")
+        self.declare_parameter_if_missing("capture_sync_require_mount", False)
         self.declare_parameter_if_missing("capture_sync_timeout_sec", 1800.0)
         self.declare_parameter_if_missing("capture_sync_attempts", 3)
         self.declare_parameter_if_missing("capture_sync_retry_delay_sec", 10.0)
@@ -1768,6 +1769,7 @@ class MissionDriver(Node):
                 float(self.get_parameter("capture_sync_timeout_sec").value),
                 int(self.get_parameter("capture_sync_attempts").value),
                 float(self.get_parameter("capture_sync_retry_delay_sec").value),
+                bool(self.get_parameter("capture_sync_require_mount").value),
             )
         except (ValueError, OSError) as exc:
             self.report_capture_sync("SYNC_FAILED", str(exc))

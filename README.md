@@ -5,10 +5,20 @@
 ## 도킹 후 capture 폴더 동기화
 
 `mission_config.yaml`의 `capture_sync_enabled: true`이면 START 또는 HOME의 실제
-도킹 명령이 성공한 직후, 서버가 로봇의 `~/capture/` 전체를 서버의 `~/capture/`로
-SSH + rsync로 가져옵니다. `docking_ssh_*` 접속 설정을 그대로 사용하며 현재 대상은
-`user@192.168.0.15:/home/user/capture/` → `/root/capture/`입니다.
-서버 경로의 `~`는 mission_driver 실행 사용자의 홈으로 해석됩니다.
+도킹 명령이 성공한 직후, 로봇의 `~/capture/` 전체를 Jetson 호스트의
+`~/capture/`로 SSH + rsync로 가져옵니다. 컨테이너 안에서는 Jetson의 폴더를
+`/mnt/jetson_capture`에 bind mount해야 합니다. 기존 `docking_ssh_*` 설정을
+사용하며 현재 원본은 `user@192.168.0.15:/home/user/capture/`입니다.
+
+스크립트는 기존 컨테이너의 `/root/capture`에 받은 사진도 Jetson
+`~/capture`로 복사합니다. 성공 시 `2404_jazzy`는 중지된 상태로 남고,
+새 컨테이너가 실행됩니다. 새 컨테이너에서 평소 ROS 실행 명령으로
+`drive_manager`를 시작합니다. 실패 시 새 컨테이너를 정리하고 기존 컨테이너를
+접속은 `docker exec -it drive_manager /bin/bash`,
+재시작은 `docker start drive_manager`를 사용합니다.
+
+`capture_sync_require_mount: true`라서 mount가 없으면 동기화가 `SYNC_FAILED`로
+끝나며 컨테이너 자체 파일시스템에 새 사진을 저장하지 않습니다.
 
 - 양쪽 장비에 `rsync`가 설치되어 있어야 합니다 (`sudo apt-get install rsync`).
 - 이미지, metadata, 숨김 파일을 포함하여 하위 폴더 구조를 유지합니다.

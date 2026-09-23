@@ -41,11 +41,12 @@ class CaptureSync:
         self.worker = threading.Thread(target=self._worker, daemon=True)
         self.worker.start()
 
-    def request(self, command, destination, timeout, attempts, retry_delay):
+    def request(self, command, destination, timeout, attempts, retry_delay,
+                require_mount=False):
         if self.stopping.is_set():
             return
         job = (list(command), destination, max(1.0, timeout),
-               max(1, attempts), max(0.0, retry_delay))
+               max(1, attempts), max(0.0, retry_delay), require_mount)
         try:
             self.pending.put_nowait(job)
         except queue.Full:
@@ -70,10 +71,22 @@ class CaptureSync:
             finally:
                 self.pending.task_done()
 
-    def _sync(self, command, destination, timeout, attempts, retry_delay):
-        Path(destination).expanduser().mkdir(parents=True, exist_ok=True)
+    def _sync(self, command, destination, timeout, attempts, retry_delay,
+              require_mount):
+        destination = Path(destination).expanduser()
+        if require_mount:
+            if not destination.is_dir() or not os.path.ismount(destination):
+                self.report('SYNC_FAILED',
+                            f'Jetson capture bind mount is missing: {destination}')
+                return
+        else:
+            destination.mkdir(parents=True, exist_ok=True)
         for attempt in range(1, attempts + 1):
             if self.stopping.is_set():
+                return
+            if require_mount and not os.path.ismount(destination):
+                self.report('SYNC_FAILED',
+                            f'Jetson capture bind mount disappeared: {destination}')
                 return
             self.report('SYNCING', f'attempt={attempt}/{attempts}, destination={destination}')
             try:

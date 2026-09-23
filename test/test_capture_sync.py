@@ -79,6 +79,38 @@ def test_failed_transfer_retries_then_reports_failure(tmp_path):
         sync.close()
 
 
+def test_missing_jetson_mount_fails_without_creating_container_directory(tmp_path):
+    destination = tmp_path / 'jetson_capture'
+    events = []
+    sync = CaptureSync(lambda status, detail: events.append((status, detail)))
+    sync._run = Mock()
+    try:
+        sync.request(['rsync'], destination, 10, 3, 0, require_mount=True)
+        wait_for(lambda: bool(events))
+        assert events[0][0] == 'SYNC_FAILED'
+        assert str(destination) in events[0][1]
+        assert not destination.exists()
+        sync._run.assert_not_called()
+    finally:
+        sync.close()
+
+
+def test_jetson_mount_check_allows_transfer_when_present(tmp_path, monkeypatch):
+    destination = tmp_path / 'jetson_capture'
+    destination.mkdir()
+    monkeypatch.setattr('drive_manager.capture_sync.os.path.ismount',
+                        lambda path: Path(path) == destination)
+    events = []
+    sync = CaptureSync(lambda status, detail: events.append((status, detail)))
+    sync._run = Mock(return_value=(True, 'ok'))
+    try:
+        sync.request(['rsync'], destination, 10, 1, 0, require_mount=True)
+        wait_for(lambda: any(status == 'SYNC_SUCCEEDED' for status, _ in events))
+        sync._run.assert_called_once()
+    finally:
+        sync.close()
+
+
 def test_timeout_and_shutdown_terminate_transfer(tmp_path):
     events = []
     sync = CaptureSync(lambda status, detail: events.append((status, detail)))
@@ -149,3 +181,27 @@ def test_disabled_or_shutting_down_driver_does_not_sync(enabled, stopping):
     driver.capture_sync = Mock()
     driver.start_capture_sync()
     driver.capture_sync.request.assert_not_called()
+
+
+def test_driver_queues_jetson_bind_mount_destination():
+    driver = MissionDriver.__new__(MissionDriver)
+    values = {
+        'capture_sync_enabled': True,
+        'capture_sync_local_directory': '/mnt/jetson_capture',
+        'capture_sync_require_mount': True,
+        'capture_sync_timeout_sec': 1800.0,
+        'capture_sync_attempts': 3,
+        'capture_sync_retry_delay_sec': 10.0,
+        'docking_ssh_user': 'user',
+        'docking_ssh_host': '192.168.0.15',
+        'docking_ssh_port': 22,
+        'docking_ssh_identity_file': '/root/.ssh/id_ed25519_drive_manager',
+        'docking_ssh_strict_host_key_checking': 'accept-new',
+    }
+    driver.get_parameter = Mock(side_effect=lambda name: SimpleNamespace(value=values[name]))
+    driver.shutdown_event = threading.Event()
+    driver.capture_sync = Mock()
+    driver.start_capture_sync()
+    args = driver.capture_sync.request.call_args.args
+    assert args[0][-1] == '/mnt/jetson_capture/'
+    assert args[1:] == ('/mnt/jetson_capture', 1800.0, 3, 10.0, True)

@@ -1,3 +1,52 @@
+## 중복 실행 및 Nav2 lifecycle 실패 방지
+
+`drive_manager.launch.py`는 같은 호스트·사용자·ROS_DOMAIN_ID에서 한 번만 실행됩니다.
+이미 실행 중이면 두 번째 launch는 기존 PID를 출력하고 노드 생성 전에 종료합니다.
+기존 터미널에서 Ctrl+C 후 노드 종료가 끝나면 다시 실행하세요. 백그라운드로 실행한
+launch는 오류 메시지에 표시된 launch PID에 `kill -INT <PID>`를 보내 종료할 수 있습니다.
+각 자식 프로세스는 launch가 종료되면 함께 종료하도록 실행합니다. 시작 도중 Ctrl+C를
+눌러 launch의 종료 처리 전에 생성된 노드도 부모 종료 시 남지 않도록 보호합니다.
+
+다른 호스트나 별도 launch에서 같은 Nav2 노드를 띄운 경우에는 ROS 그래프의 중복을
+검사하여 출발과 lifecycle 명령을 거부합니다. 중복 launch를 종료한 뒤 정상 인스턴스
+하나만 다시 시작하세요. DDS의 `Failed to find a free participant index`와 반복 respawn이
+같이 보이면 중복 프로세스부터 확인하세요.
+
+supervisor는 lifecycle manager의 `node_names`에 등록된 모든 노드 상태를 확인합니다.
+reset 성공에는 모든 노드가 `unconfigured`여야 하며, `inactive`나 manager의 비활성
+플래그만으로 reset 성공을 판정하지 않습니다. reset/cleanup 실패 또는 서로 다른 노드
+상태에서는 STARTUP을 보내지 않고 실제 상태를 로그에 기록합니다.
+START의 Nav2 reset 및 localization 활성화 확인은 출발 탈출 동작보다 먼저 실행하여,
+lifecycle 준비 실패 시 탈출 동작을 반복하지 않도록 합니다.
+
+## 출발점 경로 실패 및 START 재시도
+
+global costmap의 StaticLayer는 로봇 footprint 안의 오래된 지도 장애물을 정리합니다.
+local costmap은 scan 기반 ObstacleLayer와 InflationLayer를 사용합니다. 이 설정은
+지도 파일을 수정하지 않으며 footprint 크기와 CollisionMonitor 검사는 유지합니다.
+Jazzy의 StaticLayer footprint 정리는 메모리 안의 정적 레이어에 적용되며, 이후 map
+재수신/레이어 재생성 시 원본 지도에서 다시 로드됩니다.
+
+각 NavigateToPose 전 ComputePathToPose로 경로를 확인합니다. 경로가 없으면
+시작/목표 cost와 planner 오류를 기록하고 navigation을 pause합니다. 이때 localization은
+유지하며, 처음부터 경로가 없는 상황에서 회전/후진 복구를 반복하지 않습니다.
+센서 입력 지연 시에도 목표 취소와 navigation pause를 수행하고 AMCL을 유지합니다
+(`reset_nav2_on_robot_loss: false`). 새 START는 센서 입력과 localization을 확인한 뒤에만
+재개하며, 오래된 입력으로 자동 출발하지 않습니다.
+
+START의 탈출은 DOCKED 상태에서만 수행합니다. 이미 도크 밖에서 AMCL 위치가 잡힌
+경우에는 현재 위치로 순회를 시작하며 고정 departure_initial_pose로 재설정하지 않습니다.
+탈출 후 localization 준비가 실패한 재시도에도 탈출을 반복하지 않습니다.
+정지 중 AMCL 확인에는 no-motion update를 사용하고, 초기 pose가 수신된 후에는
+/initialpose를 계속 발행해서 particle filter를 반복 초기화하지 않습니다.
+
+도크 밖에서 프로그램을 다시 실행할 때는 다음을 사용하고 웹에서 실제 초기 위치를
+지정한 뒤 START를 누르세요.
+
+```bash
+ros2 launch drive_manager drive_manager.launch.py assume_docked_on_start:=false
+```
+
 # drive_manager
 
 헤드리스 Nav2 실행과 로봇 주행 미션 노드를 위한 ROS 2 패키지입니다.
@@ -478,13 +527,36 @@ ros2 topic echo /mission_route_points
 
 명령 동작:
 
-- `START`: Nav2가 비활성인 상태로 dock escape를 실행하고, `departure_initial_pose`로 AMCL을 초기화한 뒤 patrol_points를 순회합니다. 복귀·도킹 성공 후 Nav2를 다시 reset합니다.
+- `START`: Nav2가 비활성인 상태로 dock escape를 실행하고, `departure_initial_pose`로 AMCL을 초기화한 뒤 `home_to_patrol_pose`를 거쳐 patrol_points를 순회합니다. `navigate_to_home_to_patrol_pose: false`로 설정하면 HOME_TO_PATROL 이동을 생략합니다. 복귀·도킹 성공 후 Nav2를 다시 reset합니다.
 - `HOME`: 어디에 있든 현재 미션을 중단하고 home_to_dock_pose로 이동한 뒤 SSH 도킹 명령을 실행합니다.
 - `STOP`: 현재 Nav2 goal 또는 도킹 SSH 프로세스를 중단하고 `/cmd_vel` 0을 발행합니다.
 - `ESTOP`: STOP과 같지만 latch 상태가 되어 `RESET` 전까지 START/HOME을 거부합니다.
 - `RESET`: ESTOP latch를 해제합니다.
 
 START 중 START를 다시 누르면 `mission_driver`가 `BUSY` 상태를 발행하고 기존 미션을 계속 진행합니다. START 중 HOME을 누르면 현재 goal을 취소하고 HOME 복귀 미션으로 전환합니다.
+
+### 배터리 부족 시 자동 복귀
+
+`START` 미션 실행 중 `/battery_state` (`sensor_msgs/msg/BatteryState`)의
+`percentage`가 **20% 이하**이면 기존 `HOME` 명령 처리를 호출합니다.
+진행 중인 목표를 취소하고 촬영 run을 정리한 뒤 `home_to_dock_pose`로 이동하고,
+방향 정렬과 Nav2 pause 후 SSH 도킹 명령까지 실행합니다.
+로그에는 `Low battery (...); requesting HOME`이 기록됩니다.
+
+`mission_config.yaml`의 `low_battery_return_enabled`로 사용 여부,
+`low_battery_threshold`로 기준(기본 `0.20`), `battery_topic`으로 입력 토픽을 설정합니다.
+`percentage`는 0~1 범위이며 **20%는 `0.20`**입니다. 배터리 발행 노드는
+`present: true`, 유효한 잔량과 현재 ROS 시간 기준의 `header.stamp`를 제공해야 합니다.
+NaN, 범위 밖의 잔량, 배터리 미장착, `battery_message_timeout_sec`(기본 5초)보다
+오래되거나 미래 시각이 0.5초를 넘는 메시지는 사용하지 않습니다.
+메시지가 없거나 유효하지 않으면 배터리에 의한 자동 복귀는 발생하지 않습니다.
+
+유효한 저잔량 메시지를 받으면 이전에 20% 초과였는지와 관계없이 복귀합니다.
+한 START 미션에서 한 번만 요청하며, 이미 START의 마지막 복귀·정렬·도킹 단계이거나
+HOME 실행 중이면 현재 복귀를 계속합니다. 대기, 수동 조종, STOP/ESTOP 처리 중에는
+배터리만으로 HOME을 요청하지 않습니다. 새 START 미션에서는 다시 감시합니다.
+자동 복귀도 기존 HOME과 같은 센서·위치 추정·경로 및 원격 도킹 성공 조건을 적용하며,
+도킹 또는 실제 충전 성공을 보장하는 것은 아닙니다.
 
 ### HOME 도착과 도킹 전 방향 보정
 
@@ -498,6 +570,24 @@ NAVIGATING HOME_TO_DOCK (위치 15cm / 방향 0.10rad 이내)
 -> Nav2 navigation pause
 -> DOCKING (SSH 도킹 실행)
 ```
+
+복귀 주행 중 `FollowPath`의 `TF_ERROR(102)`로 Nav2 goal이 중단되면 바로 미션을
+포기하지 않습니다. `HOME_NAVIGATION_RECOVERING` 상태에서 0 속도 명령을 보내고
+navigation을 pause한 뒤, 센서·AMCL 공분산·0.5초 이내 TF 회복을 최대 10초
+기다립니다. 정지 확인 후 현재 위치·방향을 다시 검사합니다.
+이미 위치 15cm / 방향 약 3도 기준을 만족하면 Nav2를 재활성화하거나 목표를
+재전송하지 않고, 기존 도킹 전 최종 확인을 거쳐 SSH 도킹으로 넘깁니다.
+아직 도착하지 않았다면 현재 AMCL 위치를 유지하여 Nav2를 활성화하고 같은
+HOME 목표를 다시 계획·실행합니다. departure 초기 위치로 되돌리지는 않습니다.
+
+`home_navigation_tf_retries`(기본 2회)와
+`home_navigation_recovery_timeout_sec`(기본 10초)로 이 동작을 조절합니다.
+0회로 설정하면 자동 재시도를 끕니다. 다른 주행 오류, 취소, STOP/ESTOP,
+회복 시간 초과에는 목표를 재전송하지 않으며 도킹도 실행하지 않습니다.
+회복 대기 중에는 웹 수동 조작을 해제하고 FORCE 진입을 차단합니다.
+정지 상태의 제한된 회복 대기는 자체 시간 제한으로 처리하며, 일반 주행의
+`robot_loss_grace_sec` 검사가 이를 먼저 중단하지 않도록 분리했습니다.
+태그 검출·카메라 전송 실패를 무시하는 기능은 아닙니다.
 
 `behavior_trees/navigate_home.xml`은 HOME 전용 `HomeFollowPath`,
 `home_goal_checker`, `home_progress_checker`를 선택합니다. 순찰과 일반 Nav2 goal은
@@ -513,14 +603,20 @@ HOME 컨트롤러는 회전 전환 반경을 15cm로 맞추고 정지 판단 속
 보정합니다. 회전은 최대 3회, 회당 15초로 제한하며 회전 후 정지·위치·방향을
 다시 확인합니다. 이미 정렬돼 있으면 회전하지 않습니다.
 
+TF가 잠시 늦거나 조회되지 않으면 0 속도 명령을 보내 정지를 유지하면서,
+각 TF 검사마다 `home_pose_wait_timeout_sec`(기본 5초) 이내에 새 TF가 들어오기를
+기다립니다. 회복하면 기존 위치·방향 기준으로 재검사한 뒤 도킹으로 넘깁니다.
+`home_pose_max_age_sec`(기본 0.5초)는 유지하므로 오래된 자세로 도킹을 시작하지 않습니다.
+
 정지 확인에는 기존 `capture_stop_settle_sec`, `capture_stop_timeout_sec`,
 `capture_stopped_linear_mps`, `capture_stopped_angular_rps` 기준을 공유합니다.
-`mission_config.yaml`의 `home_alignment_*`, `home_pose_max_age_sec`로 보정 조건을
+`mission_config.yaml`의 `home_alignment_*`, `home_pose_max_age_sec`,
+`home_pose_wait_timeout_sec`로 보정 조건을
 조절할 수 있습니다. 위치 기준 변경 시 `home_arrival_xy_tolerance_m`과
 `stella.yaml`의 `home_goal_checker.xy_goal_tolerance`,
 `HomeFollowPath.xy_goal_tolerance`를 함께 맞춰야 합니다.
 
-위치 이탈, 오래되거나 미래 시각인 TF, 정지 확인 실패, 회전 실패·시간 초과 시에는
+위치 이탈, 제한 시간 안에 TF가 회복되지 않음, 정지 확인 실패, 회전 실패·시간 초과 시에는
 `ERROR home_alignment_failed`와 미션 실패를 발행하며 도킹을 실행하지 않습니다.
 `HOME_ALIGNING` 중 STOP/ESTOP은 회전을 취소하고 웹 FORCE 조작도 차단합니다.
 이 보정은 설정된 `home_to_dock_pose`의 yaw를 기준으로 하므로, 해당 yaw가 실제
@@ -948,10 +1044,12 @@ mission_driver:
   ros__parameters:
     route_points_topic: "/mission_route_points"
     route_points_publish_period_sec: 1.0
+    # 순회/도킹 좌표를 등록한 지도. drive_manager.launch.py의 기본 map입니다.
+    navigation_map_yaml: "~/map_1005-2.yaml"
 
     # patrol_points처럼 사용할 구역 이름만 순서대로 지정
     capture_enabled: false
-    capture_required: true
+    capture_required: false
     capture_zone_names: ["A", "B"]
     capture_min_distance_m: 1.0
     capture_trigger_min_linear_mps: 0.02
@@ -965,7 +1063,10 @@ mission_driver:
     capture_service_timeout_sec: 35.0
     capture_finish_wait_timeout_sec: 40.0
     capture_failure_stops_mission: false
-    capture_map_id: "map_0903"
+    capture_max_consecutive_failures: 1
+    capture_resume_timeout_sec: 10.0
+    amcl_nomotion_update_service: "/request_nomotion_update"
+    # map_id는 navigation_map_yaml 파일명으로 자동 입력 (예: map_1031)
     capture_zone_revision: "yaml_v1"
     capture_run_start_service: "/camera/capture_run/start"
     capture_pair_service: "/camera/capture_pair"
@@ -980,7 +1081,7 @@ mission_driver:
     home_to_dock_pose: [-0.265, 4.405, 1.0472]
     departure_initial_pose: [-0.265, 4.405, -1.5708]
     docked_pose: [-0.265, 4.405, 1.0472]
-    navigate_to_home_to_patrol_pose: false
+    navigate_to_home_to_patrol_pose: true
     reset_nav2_after_docking: true
 
     patrol_points: ["point_1", "point_2", "point_3"]
@@ -1055,9 +1156,33 @@ ROS 2 Jazzy는 타입 정보가 없는 빈 배열 파라미터를 로드하지 �
 `NavigateToPose` goal을 제어된 방식으로 취소하고, odometry가 설정된 속도 이하로
 `capture_stop_settle_sec` 동안 유지되는 것을 확인한 뒤 `CapturePair`를 호출합니다. 촬영이
 끝나면 동일한 Nav2 목적지를 다시 전송해 순회를 계속합니다. 위치가
-`capture_pose_timeout_sec`보다 오래되거나 정지 확인이 `capture_stop_timeout_sec` 안에
-끝나지 않으면 해당 촬영을 건너뜁니다. 한 번에 하나의 `CapturePair` 요청만 허용하며 마지막
+`capture_pose_timeout_sec`보다 오래되면 `capture_failure_stops_mission: false`에서
+해당 촬영을 건너뛰고 주행 입력 회복을 확인한 뒤 같은 목적지로 계속 이동합니다.
+정지 확인이 `capture_stop_timeout_sec` 안에 끝나지 않으면 미션을 중단합니다.
+한 번에 하나의 `CapturePair` 요청만 허용하며 마지막
 응답을 받은 뒤에만 finish 서비스를 호출합니다.
+
+`capture_failure_stops_mission: false`에서는 개별 카메라 오류와 촬영용 위치 지연을 경고로 기록하고
+순회를 계속합니다. 좌우 중 한쪽이라도 저장되면 부분 촬영 성공으로 받아들여
+실패 횟수를 초기화하고 다음 거리·구역에서도 촬영을 계속합니다. 촬영 서버는
+한 카메라가 처음 실패하면 해당 run의 남은 요청에서 그쪽의 접속·촬영을 생략하고
+정상인 쪽만 촬영합니다. metadata에는 첫 실패 원인과 이후 생략 사유를 남깁니다.
+다음 START의 새 run에서는 양쪽을 다시 시도합니다. 현재 촬영 간격은 1m입니다.
+응답의 run/request ID가 일치할 때만 저장 결과를 인정합니다.
+`capture_max_consecutive_failures: 1`이면 양쪽 모두 저장 실패하거나 촬영용 위치 확보에
+실패한 뒤 해당 run의 남은 촬영을 건너뛰어 반복 정지를 피합니다.
+다음 START에서는 실패 횟수를 초기화해 카메라를 다시 시도합니다.
+`capture_max_consecutive_failures: 0`이면 오류가 나도 이후 구역에서 계속 시도합니다.
+`capture_required`는 run 시작과 완료를 필수로 요구하는 별도 설정입니다.
+현재 설정인 `false`에서는 run 시작이 실패해도 사진 없이 순회하고, 완료 실패도
+주행·도킹 성공 결과를 실패로 바꾸지 않습니다.
+
+촬영 후에는 odometry/scan 입력, AMCL 공분산, 최신 map TF를 확인합니다.
+정지 중 공분산이나 map TF가 회복되지 않으면 `/request_nomotion_update`로 실제
+스캔에 따른 AMCL 갱신을 요청합니다. 재주행 제한 시간 동안 회복하지 못할 경우
+실패한 조건과 센서/TF 시간 차이를 로그로 기록합니다. 센서 입력은 정상이고
+위치 확인만 실패했다면 navigation을 pause하고 AMCL의 현재 위치를 보존합니다.
+실제 센서 입력이 사라졌을 때는 robot-loss 정지 처리를 수행합니다.
 
 START 미션의 복귀 구간인 `HOME_TO_DOCK`에서는 촬영하지 않습니다. 또한 선속도가
 `capture_trigger_min_linear_mps`보다 낮거나 각속도가

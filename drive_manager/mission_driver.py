@@ -16,6 +16,7 @@ import uuid
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from drive_manager.capture_sync import CaptureSync, build_sync_command
+from drive_manager.stack_health import duplicate_stack_nodes
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from inspection_interfaces.msg import CaptureZone
 from inspection_interfaces.srv import (
@@ -24,9 +25,10 @@ from inspection_interfaces.srv import (
     FinishCaptureRun,
     StartCaptureRun,
 )
-from nav2_msgs.action import NavigateToPose, Spin
-from nav2_msgs.srv import ClearEntireCostmap
+from nav2_msgs.action import ComputePathToPose, FollowPath, NavigateToPose, Spin
+from nav2_msgs.srv import ClearEntireCostmap, GetCostmap
 from nav_msgs.msg import Odometry
+from rcl_interfaces.srv import GetParameters
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
@@ -39,9 +41,9 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from rclpy.time import Time
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import BatteryState, LaserScan
 from std_msgs.msg import Bool, String
-from std_srvs.srv import Trigger
+from std_srvs.srv import Empty, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
@@ -126,6 +128,15 @@ def capture_distance_reached(x, y, last_position, minimum_distance):
     )
 
 
+def sensor_stamp_is_fresh(stamp, now_seconds, timeout_seconds):
+    """Reject old or future-dated sensor data even if it arrived recently."""
+    if stamp is None:
+        return False
+    stamp_seconds = float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+    age = float(now_seconds) - stamp_seconds
+    return math.isfinite(age) and -0.5 <= age <= float(timeout_seconds)
+
+
 def robot_motion_allows_capture(
     linear_speed,
     angular_speed,
@@ -147,6 +158,14 @@ def robot_motion_allows_capture(
         float(linear_speed) >= float(minimum_linear_speed)
         and float(angular_speed) <= float(maximum_angular_speed)
     )
+
+
+def map_id_from_yaml_path(map_yaml_path):
+    """Use the map YAML file name without extension, e.g. ~/map_1031.yaml -> map_1031."""
+    path = str(map_yaml_path or "").strip()
+    if not path:
+        return ""
+    return os.path.splitext(os.path.basename(os.path.expanduser(path)))[0]
 
 
 def normalize_capture_zone_names(zone_names):
@@ -197,7 +216,11 @@ class MissionDriver(Node):
         self.declare_parameter_if_missing("home_alignment_max_attempts", 3)
         self.declare_parameter_if_missing("home_alignment_timeout_sec", 15.0)
         self.declare_parameter_if_missing("home_pose_max_age_sec", 0.5)
+        self.declare_parameter_if_missing("home_pose_wait_timeout_sec", 5.0)
+        self.declare_parameter_if_missing("home_navigation_tf_retries", 2)
+        self.declare_parameter_if_missing("home_navigation_recovery_timeout_sec", 10.0)
         self.declare_parameter_if_missing("ensure_nav2_active", True)
+        self.declare_parameter_if_missing("navigation_map_yaml", "")
         self.declare_parameter_if_missing(
             "start_localization_on_startup",
             True,
@@ -210,6 +233,7 @@ class MissionDriver(Node):
             "keep_localization_active_when_idle",
             True,
         )
+        self.declare_parameter_if_missing("robot_loss_grace_sec", 3.0)
         self.declare_parameter_if_missing("odom_topic", "/odom")
         self.declare_parameter_if_missing("scan_topic", "/scan")
         self.declare_parameter_if_missing("amcl_pose_topic", "/amcl_pose")
@@ -217,6 +241,10 @@ class MissionDriver(Node):
         self.declare_parameter_if_missing("robot_pose_topic", "/robot_pose")
         self.declare_parameter_if_missing("robot_pose_status_topic", "/robot_pose_status")
         self.declare_parameter_if_missing("web_teleop_active_topic", "/web_teleop/active")
+        self.declare_parameter_if_missing("battery_topic", "/battery_state")
+        self.declare_parameter_if_missing("low_battery_return_enabled", True)
+        self.declare_parameter_if_missing("low_battery_threshold", 0.20)
+        self.declare_parameter_if_missing("battery_message_timeout_sec", 5.0)
         self.declare_parameter_if_missing("capture_enabled", False)
         self.declare_parameter_if_missing("capture_required", True)
         self.declare_parameter_if_missing("capture_zone_names", ["A", "B"])
@@ -229,11 +257,15 @@ class MissionDriver(Node):
         self.declare_parameter_if_missing("capture_stopped_linear_mps", 0.02)
         self.declare_parameter_if_missing("capture_stopped_angular_rps", 0.05)
         self.declare_parameter_if_missing("capture_pose_timeout_sec", 2.0)
+        self.declare_parameter_if_missing("capture_resume_timeout_sec", 10.0)
         # RTSP capture can take up to about 30 seconds when a stream is unhealthy.
         self.declare_parameter_if_missing("capture_service_timeout_sec", 35.0)
         self.declare_parameter_if_missing("capture_finish_wait_timeout_sec", 40.0)
         self.declare_parameter_if_missing("capture_failure_stops_mission", False)
-        self.declare_parameter_if_missing("capture_map_id", "map_0903")
+        self.declare_parameter_if_missing("capture_max_consecutive_failures", 1)
+        self.declare_parameter_if_missing(
+            "amcl_nomotion_update_service", "/request_nomotion_update"
+        )
         self.declare_parameter_if_missing("capture_zone_revision", "yaml_v1")
         self.declare_parameter_if_missing(
             "capture_run_start_service",
@@ -252,6 +284,7 @@ class MissionDriver(Node):
             "/camera/capture_run/abort",
         )
         self.declare_parameter_if_missing("odom_frame", "odom")
+        self.declare_parameter_if_missing("navigation_plan_timeout_sec", 10.0)
         self.declare_parameter_if_missing("base_frame", "base_link")
         self.declare_parameter_if_missing("map_frame", "map")
         self.declare_parameter_if_missing("robot_message_timeout_sec", 2.0)
@@ -265,7 +298,7 @@ class MissionDriver(Node):
         self.declare_parameter_if_missing("amcl_stable_samples", 3)
         self.declare_parameter_if_missing("assume_docked_on_start", True)
         self.declare_parameter_if_missing("reset_nav2_after_docking", True)
-        self.declare_parameter_if_missing("reset_nav2_on_robot_loss", True)
+        self.declare_parameter_if_missing("reset_nav2_on_robot_loss", False)
         self.declare_parameter_if_missing("navigate_to_home_to_patrol_pose", False)
 
         self.declare_parameter_if_missing(
@@ -374,6 +407,12 @@ class MissionDriver(Node):
             self.odom_callback,
             qos_profile_sensor_data,
         )
+        self.battery_sub = self.create_subscription(
+            BatteryState,
+            self.get_parameter("battery_topic").value,
+            self.battery_callback,
+            qos_profile_sensor_data,
+        )
         self.scan_sub = self.create_subscription(
             LaserScan,
             self.get_parameter("scan_topic").value,
@@ -408,8 +447,16 @@ class MissionDriver(Node):
             NavigateToPose,
             self.get_parameter("navigate_action").value,
         )
+        self.plan_client = ActionClient(self, ComputePathToPose, "/compute_path_to_pose")
+        self.global_costmap_client = self.create_client(GetCostmap, "/global_costmap/get_costmap")
         self.home_spin_client = ActionClient(
             self, Spin, self.get_parameter("home_spin_action").value,
+        )
+        self.amcl_nomotion_client = self.create_client(
+            Empty, str(self.get_parameter("amcl_nomotion_update_service").value)
+        )
+        self.map_parameters_client = self.create_client(
+            GetParameters, "/map_server/get_parameters"
         )
         self.supervisor_clients = {
             "start_localization": self.create_client(
@@ -477,19 +524,25 @@ class MissionDriver(Node):
         self.zero_until_time = 0.0
         self.last_feedback_time = 0.0
         self.last_odom_received = None
+        self.last_odom_stamp = None
         self.last_odom_linear_speed = None
         self.last_odom_angular_speed = None
         self.last_scan_received = None
+        self.last_scan_stamp = None
         self.last_scan_frame = None
         self.last_amcl_received = None
         self.last_amcl_pose = None
         self.amcl_sequence = 0
         self.pose_mode = "UNKNOWN"
+        self.pending_departure_initial_pose = None
         self.nav2_expected_active = False
         self.robot_was_ready = False
         self.robot_loss_handling = False
+        self.home_navigation_recovery_active = False
+        self.robot_unready_since = None
         self.web_teleop_active = False
         self.active_mission_command = None
+        self.start_returning_home = False
         self.invalid_capture_zones = []
         self.capture_zones = self.get_capture_zones()
         self.capture_min_distance_m = max(
@@ -507,6 +560,7 @@ class MissionDriver(Node):
         self.capture_run_id = ""
         self.capture_mission_id = ""
         self.capture_request_sequence = 0
+        self.capture_consecutive_failures = 0
         self.last_capture_directory = ""
 
         self.zero_timer = self.create_timer(0.1, self.zero_timer_callback)
@@ -555,12 +609,14 @@ class MissionDriver(Node):
         angular = msg.twist.twist.angular
         with self.sensor_lock:
             self.last_odom_received = time.monotonic()
+            self.last_odom_stamp = msg.header.stamp
             self.last_odom_linear_speed = math.hypot(linear.x, linear.y)
             self.last_odom_angular_speed = abs(angular.z)
 
     def scan_callback(self, msg):
         with self.sensor_lock:
             self.last_scan_received = time.monotonic()
+            self.last_scan_stamp = msg.header.stamp
             self.last_scan_frame = msg.header.frame_id
 
     def amcl_pose_callback(self, msg):
@@ -610,6 +666,45 @@ class MissionDriver(Node):
             f"yaw={initial_pose[2]:.3f}"
         )
         self.command_queue.put(self.MANUAL_INITIAL_POSE_COMMAND)
+
+    def battery_callback(self, msg):
+        """Request HOME once when a valid low-battery sample arrives during START."""
+        if not bool(self.get_parameter("low_battery_return_enabled").value):
+            return
+
+        percentage = float(msg.percentage)
+        threshold = float(self.get_parameter("low_battery_threshold").value)
+        timeout = float(self.get_parameter("battery_message_timeout_sec").value)
+        if (not math.isfinite(threshold) or not 0.0 < threshold <= 1.0
+                or not math.isfinite(timeout) or timeout <= 0.0):
+            self.get_logger().error(
+                "Invalid low-battery threshold or message timeout",
+                throttle_duration_sec=30.0,
+            )
+            return
+        if not msg.present or not math.isfinite(percentage) or not 0.0 <= percentage <= 1.0:
+            return
+        now_ros = self.get_clock().now().nanoseconds * 1.0e-9
+        if not sensor_stamp_is_fresh(msg.header.stamp, now_ros, timeout):
+            return
+        # BatteryState uses float32: 20% can deserialize as 0.20000000298.
+        if percentage > threshold and not math.isclose(
+            percentage, threshold, rel_tol=0.0, abs_tol=1.0e-7,
+        ):
+            return
+
+        with self.state_lock:
+            if (not self.mission_active or self.active_mission_command != "START"
+                    or self.start_returning_home or self.interrupt_reason is not None
+                    or self.estop_latched or self.web_teleop_active
+                    or self.shutdown_event.is_set()):
+                return
+            self.start_returning_home = True
+
+        self.get_logger().warn(
+            f"Low battery ({percentage:.1%} <= {threshold:.1%}); requesting HOME"
+        )
+        self.command_callback(String(data="HOME"))
 
     def command_callback(self, msg):
         command = msg.data.strip().upper()
@@ -683,6 +778,11 @@ class MissionDriver(Node):
                 if command == "START":
                     self.handle_start()
                 elif command == "HOME":
+                    # START may exit before publishing a result (e.g. while
+                    # localizing). Clear only its HOME handoff, preserving STOP/ESTOP.
+                    with self.state_lock:
+                        if self.interrupt_reason == "HOME":
+                            self.interrupt_reason = None
                     self.handle_home()
                 elif command == self.STARTUP_LOCALIZATION_COMMAND:
                     self.handle_startup_localization()
@@ -733,6 +833,10 @@ class MissionDriver(Node):
 
     def handle_start(self):
         self.publish_status("START_MISSION")
+        if not self.navigation_stack_is_unique():
+            self.publish_status("ERROR duplicate_navigation_nodes")
+            self.publish_command_result("START", False)
+            return
         home_to_patrol_pose = self.get_pose3_parameter("home_to_patrol_pose")
         home_to_dock_pose = self.get_pose3_parameter("home_to_dock_pose")
         departure_initial_pose = self.get_pose3_parameter("departure_initial_pose")
@@ -750,21 +854,62 @@ class MissionDriver(Node):
             self.publish_status("ERROR robot_not_ready")
             return
 
+        with self.sensor_lock:
+            departing_dock = self.pose_mode == "DOCKED"
+
+        if (bool(self.get_parameter("ensure_nav2_active").value)
+                and not self.navigation_map_matches()):
+            self.publish_status("ERROR navigation_map_mismatch")
+            return
+
         # Nav2 must not publish velocity while the open-loop dock escape runs.
         if not self.pause_navigation():
             self.publish_status("ERROR nav2_pause_failed")
             return
 
-        if not self.run_start_escape():
-            self.publish_command_result("START", False)
-            return
+        # Confirm that localization can restart before moving out of the dock.
+        # A lifecycle failure must not cause another blind escape on every START.
+        if departing_dock and bool(self.get_parameter("ensure_nav2_active").value):
+            self.publish_status("RESETTING_NAV2")
+            if not self.reset_nav2():
+                self.publish_status("ERROR nav2_reset_failed")
+                self.publish_command_result("START", False)
+                return
+            self.publish_status("STARTING_LOCALIZATION")
+            if not self.call_supervisor("start_localization"):
+                self.publish_status("ERROR nav2_not_ready")
+                self.publish_command_result("START", False)
+                return
+            if not self.navigation_map_matches():
+                self.publish_status("ERROR navigation_map_mismatch")
+                self.publish_command_result("START", False)
+                return
 
+        if departing_dock:
+            with self.sensor_lock:
+                self.pose_mode = "LOCALIZING"
+                self.pending_departure_initial_pose = None
+            if not self.run_start_escape():
+                self.publish_command_result("START", False)
+                return
+            # Even if localization or planning fails next, the robot has left
+            # the dock. A retry must not repeat escape and reset to a fixed pose.
+            with self.sensor_lock:
+                self.pending_departure_initial_pose = departure_initial_pose
+        else:
+            self.get_logger().info("Starting patrol from current localization outside the dock")
+
+        with self.sensor_lock:
+            initial_pose = (getattr(self, "pending_departure_initial_pose", None)
+                            if self.pose_mode != "AMCL" else None)
         if not self.prepare_navigation(
-            initial_pose=departure_initial_pose,
-            force_relocalize=True,
+            initial_pose=initial_pose,
+            force_relocalize=False,
         ):
             self.publish_status("ERROR nav2_not_ready")
             return
+        with self.sensor_lock:
+            self.pending_departure_initial_pose = None
 
         camera_started = self.start_capture_run()
         if (
@@ -775,6 +920,8 @@ class MissionDriver(Node):
             self.publish_status("ERROR camera_run_start_failed")
             self.publish_command_result("START", False)
             return
+        if not camera_started:
+            self.get_logger().warn("Continuing START without camera capture")
 
         self.log_start_mission(home_to_patrol_pose, patrol_points, home_to_dock_pose)
 
@@ -798,12 +945,19 @@ class MissionDriver(Node):
             if not self.navigate_or_abort("START", label, x, y, yaw):
                 return
 
+        with self.state_lock:
+            self.start_returning_home = True
         if not self.navigate_or_abort("START", "HOME_TO_DOCK", *home_to_dock_pose):
             return
 
         camera_ok = self.finish_capture_run()
         if not camera_ok:
-            self.publish_status("ERROR camera_run_finish_failed")
+            if bool(self.get_parameter("capture_required").value):
+                self.publish_status("ERROR camera_run_finish_failed")
+            else:
+                self.get_logger().warn(
+                    "Camera run could not finish; continuing return and docking"
+                )
             if self.is_capture_run_active():
                 self.abort_capture_run("finish_failed")
 
@@ -859,6 +1013,10 @@ class MissionDriver(Node):
 
         self.publish_status(f"NAVIGATING {label}")
         if not self.navigate_to_named_pose(label, x, y, yaw):
+            # Keep localization while stopping the failed navigation stack.
+            # Leaving nav2_expected_active set while idle caused later transient
+            # sensor loss to reset AMCL after the mission had already failed.
+            self.pause_navigation()
             self.publish_command_result(command, False)
             return False
 
@@ -898,6 +1056,150 @@ class MissionDriver(Node):
             raise ValueError("HOME pose error is not finite")
         return distance, yaw_error
 
+    def wait_for_home_pose_error(self, target_pose):
+        """Hold still until a fresh HOME pose is available, with a bounded wait."""
+        timeout = float(self.get_parameter("home_pose_wait_timeout_sec").value)
+        max_age = float(self.get_parameter("home_pose_max_age_sec").value)
+        if not all(math.isfinite(value) and value > 0 for value in (timeout, max_age)):
+            self.get_logger().error("Invalid HOME pose wait/freshness limits")
+            return None
+
+        deadline = time.monotonic() + timeout
+        waiting = False
+        last_error = "no fresh pose"
+        while not self.shutdown_event.is_set():
+            if self.has_interrupt_reason():
+                return None
+            if time.monotonic() >= deadline:
+                break
+            self.publish_zero_velocity()
+            try:
+                pose_error = self.get_home_pose_error(target_pose)
+            except (TransformException, ValueError) as exc:
+                last_error = str(exc)
+                if not waiting:
+                    self.get_logger().warn(
+                        f"HOME pose unavailable; holding stopped for up to {timeout:.1f}s "
+                        f"while waiting for fresh TF: {last_error}"
+                    )
+                    waiting = True
+            else:
+                if self.shutdown_event.is_set() or self.has_interrupt_reason():
+                    return None
+                if time.monotonic() >= deadline:
+                    break
+                if waiting:
+                    self.get_logger().info("HOME pose TF recovered; rechecking alignment")
+                return pose_error
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.shutdown_event.wait(min(0.1, remaining))
+
+        if not self.shutdown_event.is_set() and not self.has_interrupt_reason():
+            self.get_logger().error(
+                f"HOME pose did not recover within {timeout:.1f}s: {last_error}"
+            )
+        return None
+
+    def wait_for_home_navigation_inputs(self, target_pose):
+        """Wait stopped for current sensors, AMCL and TF before a HOME retry."""
+        timeout = float(self.get_parameter("home_navigation_recovery_timeout_sec").value)
+        if not math.isfinite(timeout) or timeout <= 0:
+            self.get_logger().error("Invalid HOME navigation recovery timeout")
+            return None
+        deadline = time.monotonic() + timeout
+        next_amcl_update = 0.0
+        last_reason = None
+        while not self.shutdown_event.is_set():
+            if self.has_interrupt_reason():
+                return None
+            if time.monotonic() >= deadline:
+                break
+            self.publish_zero_velocity()
+            inputs_ready = self.robot_is_ready()
+            with self.sensor_lock:
+                amcl_pose = self.last_amcl_pose
+            if not inputs_ready:
+                reason = "odometry, scan or robot TF is stale"
+            elif not self.amcl_covariance_is_acceptable(amcl_pose):
+                reason = "AMCL pose covariance is not acceptable"
+            else:
+                try:
+                    pose_error = self.get_home_pose_error(target_pose)
+                except (TransformException, ValueError):
+                    reason = "map-to-base TF is stale or unavailable"
+                else:
+                    if (time.monotonic() < deadline
+                            and not self.shutdown_event.is_set()
+                            and not self.has_interrupt_reason()):
+                        return pose_error
+                    return None
+            if reason != last_reason:
+                self.get_logger().warn(f"Waiting for HOME navigation recovery: {reason}")
+                last_reason = reason
+            if inputs_ready and time.monotonic() >= next_amcl_update:
+                self.request_stationary_amcl_update()
+                next_amcl_update = time.monotonic() + 0.5
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.shutdown_event.wait(min(0.1, remaining))
+        if not self.shutdown_event.is_set() and not self.has_interrupt_reason():
+            self.get_logger().error(
+                f"HOME navigation inputs did not recover within {timeout:.1f}s: "
+                f"{last_reason}; {self.describe_navigation_inputs()}"
+            )
+        return None
+
+    def recover_home_navigation_after_tf_error(self, target_pose):
+        """Return 'arrived', 'retry' or None after a stopped HOME TF recovery."""
+        if self.shutdown_event.is_set() or self.has_interrupt_reason():
+            return None
+        with self.sensor_lock:
+            self.home_navigation_recovery_active = True
+        try:
+            self.publish_status("HOME_NAVIGATION_RECOVERING")
+            self.publish_zero_velocity()
+            if not self.pause_navigation():
+                self.get_logger().error("Could not pause navigation for HOME TF recovery")
+                return None
+            if self.wait_for_home_navigation_inputs(target_pose) is None:
+                return None
+            if not self.wait_until_robot_stopped():
+                self.get_logger().error("Could not confirm stopped odometry for HOME retry")
+                return None
+            if self.shutdown_event.is_set() or self.has_interrupt_reason():
+                return None
+            pose_error = self.wait_for_home_pose_error(target_pose)
+            if pose_error is None:
+                return None
+            xy_limit = float(self.get_parameter("home_arrival_xy_tolerance_m").value)
+            yaw_limit = float(self.get_parameter("home_alignment_yaw_tolerance_rad").value)
+            if not all(math.isfinite(v) and v > 0 for v in (xy_limit, yaw_limit)):
+                self.get_logger().error("Invalid HOME arrival limits")
+                return None
+            distance, yaw_error = pose_error
+            if distance <= xy_limit and abs(yaw_error) <= yaw_limit:
+                self.get_logger().info(
+                    f"HOME arrival confirmed after TF recovery: xy_error={distance:.3f}m, "
+                    f"yaw_error={math.degrees(yaw_error):.2f}deg; keeping Nav2 paused"
+                )
+                return "arrived"
+            # Keep the current AMCL estimate; never reapply the dock departure pose.
+            if not self.prepare_navigation(initial_pose=None, force_relocalize=False):
+                self.get_logger().error("Could not resume Nav2 after HOME TF recovery")
+                return None
+            if self.shutdown_event.is_set() or self.has_interrupt_reason():
+                self.publish_zero_velocity()
+                return None
+            self.publish_status("NAVIGATING HOME_TO_DOCK")
+            return "retry"
+        finally:
+            with self.sensor_lock:
+                self.home_navigation_recovery_active = False
+
     def align_home_heading(self, target_pose):
         xy_limit = float(self.get_parameter("home_arrival_xy_tolerance_m").value)
         yaw_limit = float(self.get_parameter("home_alignment_yaw_tolerance_rad").value)
@@ -912,11 +1214,10 @@ class MissionDriver(Node):
             if not self.wait_until_robot_stopped():
                 self.get_logger().error("HOME alignment could not confirm stopped odometry")
                 return False
-            try:
-                distance, yaw_error = self.get_home_pose_error(target_pose)
-            except (TransformException, ValueError) as exc:
-                self.get_logger().error(f"HOME alignment pose unavailable: {exc}")
+            pose_error = self.wait_for_home_pose_error(target_pose)
+            if pose_error is None:
                 return False
+            distance, yaw_error = pose_error
             self.get_logger().info(
                 f"HOME alignment check {attempt}: xy_error={distance:.3f}m, "
                 f"yaw_error={math.degrees(yaw_error):.2f}deg"
@@ -1100,7 +1401,7 @@ class MissionDriver(Node):
 
         request = StartCaptureRun.Request()
         request.mission_id = f"mission_{uuid.uuid4().hex}"
-        request.map_id = str(self.get_parameter("capture_map_id").value)
+        request.map_id = self.get_capture_map_id()
         request.map_frame = str(self.get_parameter("map_frame").value)
         request.zone_revision = str(
             self.get_parameter("capture_zone_revision").value
@@ -1128,6 +1429,7 @@ class MissionDriver(Node):
             self.capture_run_id = response.run_id
             self.capture_mission_id = request.mission_id
             self.capture_request_sequence = 0
+            self.capture_consecutive_failures = 0
             self.current_capture_zone = None
             self.last_capture_position = None
             self.capture_stop_requested = False
@@ -1214,11 +1516,15 @@ class MissionDriver(Node):
 
     def call_capture_service(self, operation, request):
         timeout = float(self.get_parameter("capture_service_timeout_sec").value)
-        return self.call_service(
-            self.capture_clients[operation],
-            request,
-            timeout_sec=timeout,
-        )
+        try:
+            return self.call_service(
+                self.capture_clients[operation],
+                request,
+                timeout_sec=timeout,
+            )
+        except Exception as exc:
+            self.get_logger().warn(f"Camera {operation} service failed: {exc}")
+            return None
 
     def wait_for_capture_idle(self):
         timeout = max(
@@ -1250,6 +1556,7 @@ class MissionDriver(Node):
         self.capture_run_id = ""
         self.capture_mission_id = ""
         self.capture_request_sequence = 0
+        self.capture_consecutive_failures = 0
         self.current_capture_zone = None
         self.last_capture_position = None
         self.capture_stop_requested = False
@@ -1306,7 +1613,6 @@ class MissionDriver(Node):
             or amcl_received is None
             or now_monotonic - amcl_received > pose_timeout
         ):
-            self.reset_capture_tracking()
             return
 
         odom_timeout = max(
@@ -1329,7 +1635,6 @@ class MissionDriver(Node):
         x = float(position.x)
         y = float(position.y)
         if not math.isfinite(x) or not math.isfinite(y):
-            self.reset_capture_tracking()
             return
 
         zone = find_capture_zone(x, y, self.capture_zones)
@@ -1401,24 +1706,45 @@ class MissionDriver(Node):
                 )
                 return False
 
-            with self.sensor_lock:
-                amcl_pose = copy.deepcopy(self.last_amcl_pose)
-                amcl_received = self.last_amcl_received
-
-            now_monotonic = time.monotonic()
             pose_timeout = max(
                 0.0,
                 float(self.get_parameter("capture_pose_timeout_sec").value),
             )
-            if (
-                amcl_pose is None
-                or amcl_received is None
-                or now_monotonic - amcl_received > pose_timeout
-            ):
-                self.handle_capture_control_failure(
-                    expected_zone,
-                    "AMCL pose is unavailable after stopping",
+            with self.sensor_lock:
+                latest_pose = copy.deepcopy(self.last_amcl_pose)
+                latest_received = self.last_amcl_received
+            latest_is_fresh = (
+                latest_pose is not None
+                and latest_received is not None
+                and time.monotonic() - latest_received <= pose_timeout
+            )
+
+            # AMCL publishes only after update_min_d/update_min_a of motion, so
+            # the last sample can predate braking and settling. Ask for a scan
+            # update at the stopped position and use that sample for the photo.
+            amcl_pose = self.wait_for_stopped_capture_pose(pose_timeout)
+            if self.has_interrupt_reason() or self.shutdown_event.is_set():
+                return False
+            if amcl_pose is None and latest_is_fresh:
+                self.get_logger().warn(
+                    "No stationary AMCL update after stopping; using the latest "
+                    f"AMCL pose for zone={expected_zone}"
                 )
+                amcl_pose = latest_pose
+
+            if amcl_pose is None:
+                message = "AMCL pose is unavailable after stopping"
+                if bool(self.get_parameter("capture_failure_stops_mission").value):
+                    self.handle_capture_control_failure(expected_zone, message)
+                else:
+                    self.get_logger().warn(
+                        f"Skipping stopped capture: zone={expected_zone}, {message}"
+                    )
+                    self.record_optional_capture_failure()
+                    # A photo needs a fresh AMCL sample for its metadata, and
+                    # AMCL did not answer the stationary update request.
+                    # Skip the photo, but still wait for usable navigation inputs.
+                    self.check_capture_resume_ready(expected_zone)
                 return False
 
             position = amcl_pose.pose.pose.position
@@ -1455,13 +1781,53 @@ class MissionDriver(Node):
             request.requested_at = self.get_clock().now().to_msg()
             request.robot_pose = amcl_pose
             self.publish_status(f"CAPTURING zone={expected_zone}")
-            return self.execute_capture_request(request)
+            capture_ok = self.execute_capture_request(request)
+            if not self.check_capture_resume_ready(expected_zone):
+                return False
+            return capture_ok
         finally:
             with self.capture_lock:
                 self.capture_stop_active = False
                 self.capture_stop_requested = False
                 self.capture_stop_zone = None
                 self.capture_in_progress = False
+
+    def wait_for_stopped_capture_pose(self, timeout_sec):
+        """Return a new AMCL sample requested after the robot stopped, or None."""
+        with self.sensor_lock:
+            start_sequence = self.amcl_sequence
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        next_request = 0.0
+        while not self.shutdown_event.is_set() and not self.has_interrupt_reason():
+            with self.sensor_lock:
+                if (self.amcl_sequence != start_sequence
+                        and self.last_amcl_pose is not None):
+                    return copy.deepcopy(self.last_amcl_pose)
+            now = time.monotonic()
+            if now >= deadline:
+                return None
+            if now >= next_request:
+                self.request_stationary_amcl_update()
+                next_request = time.monotonic() + 0.5
+            self.shutdown_event.wait(
+                min(0.05, max(0.0, deadline - time.monotonic()))
+            )
+        return None
+
+    def check_capture_resume_ready(self, zone_id):
+        if self.wait_for_capture_resume_ready():
+            return True
+        if not self.has_interrupt_reason() and not self.shutdown_event.is_set():
+            if not self.robot_is_ready():
+                self.start_robot_loss_handling()
+            else:
+                # Preserve localization for recovery; do not resume a goal with
+                # unusable map TF or covariance, even when photos are optional.
+                self.handle_capture_control_failure(
+                    zone_id, "localization did not recover after capture"
+                )
+                self.pause_navigation()
+        return False
 
     def wait_until_robot_stopped(self):
         settle_sec = max(
@@ -1517,16 +1883,105 @@ class MissionDriver(Node):
             time.sleep(0.05)
         return False
 
+    def wait_for_capture_resume_ready(self):
+        """Keep the robot stopped until sensors and map pose are usable again."""
+        timeout = max(
+            0.0,
+            float(self.get_parameter("capture_resume_timeout_sec").value),
+        )
+        pose_timeout = max(
+            0.0,
+            float(self.get_parameter("capture_pose_timeout_sec").value),
+        )
+        deadline = time.monotonic() + timeout
+        next_amcl_update = 0.0
+        last_reason = None
+        while not self.shutdown_event.is_set():
+            if self.has_interrupt_reason():
+                return False
+            self.publish_zero_velocity()
+            with self.sensor_lock:
+                amcl_pose = self.last_amcl_pose
+            inputs_ready = self.robot_is_ready()
+            if not inputs_ready:
+                reason = "odometry, scan, or robot TF is not ready"
+            elif not self.amcl_covariance_is_acceptable(amcl_pose):
+                reason = "AMCL pose covariance is not acceptable"
+            elif not self.transform_is_fresh(
+                self.get_parameter("map_frame").value,
+                self.get_parameter("base_frame").value,
+                pose_timeout,
+            ):
+                reason = "map-to-base TF is stale or unavailable"
+            else:
+                return True
+            now = time.monotonic()
+            if reason != last_reason:
+                self.get_logger().warn(f"Waiting to resume after capture: {reason}")
+                last_reason = reason
+            if now >= deadline:
+                self.get_logger().error(
+                    f"Capture resume timed out: {reason}; {self.describe_navigation_inputs()}"
+                )
+                return False
+            if inputs_ready and now >= next_amcl_update:
+                # AMCL normally updates its pose only after sufficient motion.
+                # Request a real scan update while the robot is stationary;
+                # never re-seed the filter from an assumed or saved position.
+                self.request_stationary_amcl_update()
+                next_amcl_update = time.monotonic() + 1.0
+            time.sleep(0.1)
+        return False
+
+    def request_stationary_amcl_update(self):
+        try:
+            return self.call_service(
+                self.amcl_nomotion_client, Empty.Request(), timeout_sec=0.5
+            ) is not None
+        except Exception as exc:
+            self.get_logger().warn(f"AMCL no-motion update failed: {exc}")
+            return False
+
+    def describe_navigation_inputs(self):
+        """Report the actual readiness values when a recovery deadline expires."""
+        now_ros = self.get_clock().now().nanoseconds * 1.0e-9
+        now = time.monotonic()
+        with self.sensor_lock:
+            stamps = (self.last_odom_stamp, self.last_scan_stamp)
+            received = (self.last_odom_received, self.last_scan_received)
+            pose = self.last_amcl_pose
+        details = []
+        for name, stamp, arrival in zip(("odom", "scan"), stamps, received):
+            if stamp is None or arrival is None:
+                details.append(f"{name}=missing")
+            else:
+                age = now_ros - (stamp.sec + stamp.nanosec * 1.0e-9)
+                details.append(f"{name}_stamp_age={age:.3f}s, arrival_age={now-arrival:.3f}s")
+        if pose is not None:
+            cov = pose.pose.covariance
+            details.append(f"amcl_covariance=({cov[0]:.4f}, {cov[7]:.4f}, {cov[35]:.4f})")
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                str(self.get_parameter("map_frame").value),
+                str(self.get_parameter("base_frame").value), Time()
+            )
+            stamp = transform.header.stamp
+            age = now_ros - (stamp.sec + stamp.nanosec * 1.0e-9)
+            details.append(f"map_tf_age={age:.3f}s")
+        except TransformException as exc:
+            details.append(f"map_tf={exc}")
+        return "; ".join(details)
+
     def handle_capture_control_failure(self, zone_id, message):
         self.get_logger().error(f"Stopped capture failed: zone={zone_id}, error={message}")
-        if not bool(
-            self.get_parameter("capture_failure_stops_mission").value
-        ):
-            return
         with self.state_lock:
             if self.interrupt_reason is None:
-                self.interrupt_reason = "CAMERA_CAPTURE_FAILED"
-        self.publish_status("ERROR camera_capture_failed")
+                self.interrupt_reason = "CAPTURE_CONTROL_FAILED"
+        self.zero_until_time = time.time() + float(
+            self.get_parameter("stop_zero_seconds").value
+        )
+        self.publish_zero_velocity()
+        self.publish_status("ERROR capture_control_failed")
 
     def execute_capture_request(self, request):
         failure_message = None
@@ -1534,18 +1989,35 @@ class MissionDriver(Node):
             response = self.call_capture_service("capture", request)
             if response is None:
                 failure_message = "no response"
-            elif not response.success:
-                failure_message = response.message or "capture failed"
             elif response.run_id != request.run_id:
                 failure_message = "response run_id does not match request"
             elif response.request_id != request.request_id:
                 failure_message = "response request_id does not match request"
+            elif not response.success and not (response.left_file or response.right_file):
+                failure_message = response.message or "capture failed"
             else:
-                self.get_logger().info(
-                    "Capture saved: "
+                with self.capture_lock:
+                    self.capture_consecutive_failures = 0
+                detail = (
                     f"run_id={response.run_id}, capture_id={response.capture_id}, "
                     f"request_id={response.request_id}, zone={request.zone_id}"
                 )
+                if response.success:
+                    self.get_logger().info(f"Capture saved: {detail}")
+                else:
+                    # The camera server marks an incomplete pair as unsuccessful
+                    # even when one image was saved. Keep subsequent capture
+                    # requests enabled while either camera is producing images.
+                    saved = ", ".join(
+                        side for side, path in (
+                            ("left", response.left_file), ("right", response.right_file)
+                        ) if path
+                    )
+                    self.get_logger().warn(
+                        f"Partial capture saved: {detail}, saved={saved}, "
+                        f"left_error={response.left_error}, right_error={response.right_error}; "
+                        "continuing captures"
+                    )
         except Exception as exc:
             failure_message = str(exc)
         finally:
@@ -1558,13 +2030,14 @@ class MissionDriver(Node):
         return failure_message is None
 
     def handle_capture_failure(self, request, message):
-        self.get_logger().error(
-            f"Capture failed: request_id={request.request_id}, "
-            f"zone={request.zone_id}, error={message}"
-        )
-        if not bool(
+        stop_mission = bool(
             self.get_parameter("capture_failure_stops_mission").value
-        ):
+        )
+        log = self.get_logger().error if stop_mission else self.get_logger().warn
+        log(f"Capture failed: request_id={request.request_id}, "
+            f"zone={request.zone_id}, error={message}")
+        if not stop_mission:
+            self.record_optional_capture_failure()
             return
 
         with self.state_lock:
@@ -1578,6 +2051,21 @@ class MissionDriver(Node):
         if should_stop:
             self.cancel_active_goal()
             self.publish_status("ERROR camera_capture_failed")
+
+    def record_optional_capture_failure(self):
+        limit = max(
+            0, int(self.get_parameter("capture_max_consecutive_failures").value)
+        )
+        with self.capture_lock:
+            self.capture_consecutive_failures += 1
+            disabled = limit > 0 and self.capture_consecutive_failures >= limit
+            if disabled:
+                self.capture_accepting_requests = False
+        if disabled:
+            self.get_logger().warn(
+                "Skipping remaining captures in this run after capture failures; "
+                "navigation will continue and the next START will retry capture"
+            )
 
     def reset_capture_tracking(self):
         with self.capture_lock:
@@ -1941,6 +2429,9 @@ class MissionDriver(Node):
         if not self.get_parameter("ensure_nav2_active").value:
             return True
 
+        if not self.navigation_stack_is_unique():
+            return False
+
         if not self.robot_is_ready():
             self.get_logger().error("Robot inputs became stale before Nav2 startup")
             return False
@@ -1952,6 +2443,9 @@ class MissionDriver(Node):
 
         self.publish_status("STARTING_LOCALIZATION")
         if not self.call_supervisor("start_localization"):
+            return False
+
+        if not self.navigation_map_matches():
             return False
 
         with self.sensor_lock:
@@ -1982,6 +2476,60 @@ class MissionDriver(Node):
         self.publish_status("NAV2_READY")
         return True
 
+    def navigation_stack_is_unique(self):
+        duplicates = duplicate_stack_nodes(self.get_node_names_and_namespaces())
+        if duplicates:
+            self.get_logger().error(
+                "Duplicate Nav2/mission nodes: " + ", ".join(duplicates)
+                + "; stop duplicate launches before starting the robot"
+            )
+            return False
+        return True
+
+    def get_loaded_map_yaml(self):
+        """Return map_server's yaml_filename, or None when it cannot be read."""
+        request = GetParameters.Request()
+        request.names = ["yaml_filename"]
+        response = self.call_service(self.map_parameters_client, request, timeout_sec=2.0)
+        if response is None or len(response.values) != 1:
+            return None
+        return response.values[0].string_value
+
+    def get_capture_map_id(self):
+        """Name photo metadata after the map actually used for driving."""
+        map_yaml = str(self.get_parameter("navigation_map_yaml").value).strip()
+        if not map_yaml:
+            try:
+                map_yaml = self.get_loaded_map_yaml() or ""
+            except Exception as exc:
+                self.get_logger().warn(f"Cannot read map_server yaml_filename: {exc}")
+                map_yaml = ""
+        map_id = map_id_from_yaml_path(map_yaml)
+        if not map_id:
+            self.get_logger().warn(
+                "Navigation map is unknown; camera metadata map_id=unknown_map"
+            )
+            return "unknown_map"
+        return map_id
+
+    def navigation_map_matches(self):
+        expected = str(self.get_parameter("navigation_map_yaml").value).strip()
+        if not expected:
+            return True
+        actual = self.get_loaded_map_yaml()
+        if actual is None:
+            self.get_logger().error("Cannot verify the map loaded by Nav2 map_server")
+            return False
+        expected_path = os.path.realpath(os.path.expanduser(expected))
+        actual_path = os.path.realpath(os.path.expanduser(actual))
+        if not actual or actual_path != expected_path:
+            self.get_logger().error(
+                f"Navigation map mismatch: mission={expected}, map_server={actual}. "
+                "Load the map used to configure mission coordinates before driving."
+            )
+            return False
+        return True
+
     def wait_for_robot_ready(self):
         timeout = float(self.get_parameter("robot_ready_timeout_sec").value)
         deadline = time.monotonic() + timeout
@@ -2003,14 +2551,21 @@ class MissionDriver(Node):
     def robot_is_ready(self):
         timeout = float(self.get_parameter("robot_message_timeout_sec").value)
         now = time.monotonic()
+        now_ros = self.get_clock().now().nanoseconds * 1.0e-9
         with self.sensor_lock:
             odom_received = self.last_odom_received
+            odom_stamp = self.last_odom_stamp
             scan_received = self.last_scan_received
+            scan_stamp = self.last_scan_stamp
             scan_frame = self.last_scan_frame
 
         if odom_received is None or now - odom_received > timeout:
             return False
         if scan_received is None or now - scan_received > timeout:
+            return False
+        if not sensor_stamp_is_fresh(odom_stamp, now_ros, timeout):
+            return False
+        if not sensor_stamp_is_fresh(scan_stamp, now_ros, timeout):
             return False
         if not self.transform_available(
             self.get_parameter("odom_frame").value,
@@ -2030,10 +2585,24 @@ class MissionDriver(Node):
                 str(target_frame),
                 str(source_frame),
                 Time(),
-                timeout=Duration(seconds=0.05),
             )
         except TransformException:
             return False
+
+    def transform_is_fresh(self, target_frame, source_frame, max_age_sec):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                str(target_frame),
+                str(source_frame),
+                Time(),
+            )
+        except TransformException:
+            return False
+        stamp = transform.header.stamp
+        stamp_seconds = float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+        age = self.get_clock().now().nanoseconds * 1.0e-9 - stamp_seconds
+        # AMCL may deliberately date map->odom up to transform_tolerance ahead.
+        return math.isfinite(age) and -1.5 <= age <= max_age_sec
 
     def wait_for_localization(self, initial_pose):
         timeout = float(self.get_parameter("localization_timeout_sec").value)
@@ -2050,13 +2619,27 @@ class MissionDriver(Node):
         last_sequence = -1
         stable_samples = 0
         started_at = time.monotonic()
+        sensor_unready_during_wait = False
+        initial_pose_acknowledged = initial_pose is None
+        next_nomotion_update = 0.0
 
         while not self.shutdown_event.is_set() and time.monotonic() < deadline:
-            if self.has_interrupt_reason() or not self.robot_is_ready():
+            if self.has_interrupt_reason():
                 return False
 
+            if not self.robot_is_ready():
+                # Scan and TF can briefly lag during a lifecycle reset. Keep
+                # the robot stopped and use the configured localization
+                # timeout rather than failing on a single missing sample.
+                stable_samples = 0
+                sensor_unready_during_wait = True
+                self.publish_zero_velocity()
+                time.sleep(0.1)
+                continue
+
             now = time.monotonic()
-            if initial_pose is not None and now >= next_publish:
+            if (initial_pose is not None and not initial_pose_acknowledged
+                    and now >= next_publish):
                 self.publish_initial_pose(initial_pose)
                 next_publish = now + publish_period
 
@@ -2069,6 +2652,8 @@ class MissionDriver(Node):
             is_fresh = amcl_received is not None and amcl_received >= started_at
             if is_new_sample:
                 last_sequence = sequence
+                if is_fresh:
+                    initial_pose_acknowledged = True
                 if (
                     is_fresh
                     and self.amcl_covariance_is_acceptable(amcl_pose)
@@ -2086,8 +2671,16 @@ class MissionDriver(Node):
                 else:
                     stable_samples = 0
 
+            if initial_pose_acknowledged and now >= next_nomotion_update:
+                self.request_stationary_amcl_update()
+                next_nomotion_update = now + max(0.5, publish_period)
+
             time.sleep(0.1)
 
+        if sensor_unready_during_wait:
+            self.get_logger().error(
+                "Localization timed out after intermittent odometry, scan, or TF input"
+            )
         return False
 
     def publish_initial_pose(self, pose):
@@ -2197,18 +2790,57 @@ class MissionDriver(Node):
         self.robot_pose_status_pub.publish(msg)
 
     def robot_health_callback(self):
+        with self.capture_lock:
+            capture_stop_active = self.capture_stop_active
+        if capture_stop_active:
+            # The goal is canceled and zero velocity is held during capture.
+            # Let the capture worker wait for fresh inputs before resuming.
+            self.robot_unready_since = None
+            return
         with self.sensor_lock:
             nav2_expected_active = self.nav2_expected_active
             robot_was_ready = self.robot_was_ready
             handling = self.robot_loss_handling
+            home_recovery = getattr(self, "home_navigation_recovery_active", False)
+
+        if home_recovery:
+            # The goal has aborted and the worker holds zero velocity while
+            # pausing Nav2 and waiting within its own recovery deadline.
+            self.robot_unready_since = None
+            return
 
         if not nav2_expected_active or not robot_was_ready or handling:
+            self.robot_unready_since = None
             return
         if self.robot_is_ready():
+            self.robot_unready_since = None
             return
 
+        now = time.monotonic()
+        if self.robot_unready_since is None:
+            self.robot_unready_since = now
+            self.get_logger().warn(
+                "Robot odometry, scan, or TF is stale; waiting for recovery: "
+                + self.describe_navigation_inputs()
+            )
+            return
+        grace = max(0.0, float(self.get_parameter("robot_loss_grace_sec").value))
+        if now - self.robot_unready_since < grace:
+            return
+
+        self.get_logger().error(
+            f"Robot inputs remained stale for {now - self.robot_unready_since:.1f}s"
+        )
+        self.start_robot_loss_handling()
+
+    def start_robot_loss_handling(self):
+        """Stop a mission once when sensor or localization readiness is lost."""
+
         with self.sensor_lock:
+            if not self.nav2_expected_active or self.robot_loss_handling:
+                return
             self.robot_loss_handling = True
+        self.robot_unready_since = None
         self.set_interrupt_reason("ROBOT_LOST")
         self.cancel_active_goal()
         self.zero_until_time = time.time() + float(
@@ -2252,7 +2884,11 @@ class MissionDriver(Node):
             self.get_logger().error("/navigate_to_pose action server not available")
             return False
 
+        home_tf_retries = 0
         while not self.shutdown_event.is_set():
+            if not self.check_navigation_plan(label, x, y, yaw):
+                self.publish_zero_velocity()
+                return False
             goal_msg = NavigateToPose.Goal()
             goal_msg.pose = self.make_pose_stamped(x, y, yaw)
             if label == "HOME_TO_DOCK":
@@ -2338,18 +2974,126 @@ class MissionDriver(Node):
                 f"{label} failed with status={status}, "
                 f"error_code={result.error_code}, error_msg={result.error_msg}"
             )
+            if (
+                label == "HOME_TO_DOCK"
+                and status == GoalStatus.STATUS_ABORTED
+                and result.error_code == FollowPath.Result.TF_ERROR
+                and not self.has_interrupt_reason()
+                and not self.shutdown_event.is_set()
+            ):
+                retry_limit = max(0, int(self.get_parameter("home_navigation_tf_retries").value))
+                if home_tf_retries < retry_limit:
+                    home_tf_retries += 1
+                    self.get_logger().warn(
+                        f"HOME navigation TF error; recovering before retry "
+                        f"{home_tf_retries}/{retry_limit} of the same goal"
+                    )
+                    recovery = self.recover_home_navigation_after_tf_error((x, y, yaw))
+                    if recovery == "arrived":
+                        return True
+                    if recovery == "retry":
+                        continue
             return False
 
         return False
 
+    def check_navigation_plan(self, label, x, y, yaw):
+        """Plan while stationary before allowing NavigateToPose recoveries."""
+        timeout = float(self.get_parameter("navigation_plan_timeout_sec").value)
+        if not self.plan_client.wait_for_server(timeout_sec=timeout):
+            self.get_logger().error("/compute_path_to_pose action server unavailable")
+            self.publish_status("ERROR navigation_planner_unavailable")
+            return False
+        if self.has_interrupt_reason():
+            return False
+        goal = ComputePathToPose.Goal()
+        goal.goal = self.make_pose_stamped(x, y, yaw)
+        goal.planner_id = "GridBased"
+        goal.use_start = False
+        send_future = self.plan_client.send_goal_async(goal)
+        handle = self.wait_for_future(send_future, timeout, abort_on_interrupt=True)
+        if handle is None:
+            # A late acceptance must not leave a detached planning action.
+            def cancel_late_goal(future):
+                try:
+                    late_handle = future.result()
+                    if late_handle is not None and late_handle.accepted:
+                        late_handle.cancel_goal_async()
+                except Exception as exc:
+                    self.get_logger().warn(f"Failed to cancel late planning goal: {exc}")
+            send_future.add_done_callback(cancel_late_goal)
+            self.publish_status("ERROR navigation_plan_timeout")
+            return False
+        if not handle.accepted:
+            self.get_logger().error(f"{label} planning goal rejected")
+            self.publish_status("ERROR navigation_plan_rejected")
+            return False
+        response = self.wait_for_future(
+            handle.get_result_async(), timeout, abort_on_interrupt=True,
+        )
+        if response is None:
+            handle.cancel_goal_async()
+            self.publish_status("ERROR navigation_plan_timeout")
+            return False
+        result = response.result
+        if (response.status == GoalStatus.STATUS_SUCCEEDED
+                and result.error_code == 0 and result.path.poses):
+            return True
+        self.get_logger().error(
+            f"{label} cannot start navigation: planner status={response.status}, "
+            f"error_code={result.error_code}, error_msg={result.error_msg}; "
+            "no NavigateToPose goal or motion recovery was started"
+        )
+        self.log_blocked_plan_costmap(x, y)
+        self.publish_status(f"ERROR navigation_no_valid_path {label}")
+        return False
+
+    def log_blocked_plan_costmap(self, goal_x, goal_y):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                str(self.get_parameter("map_frame").value),
+                str(self.get_parameter("base_frame").value), Time(),
+            )
+            timeout = float(self.get_parameter("costmap_service_timeout_sec").value)
+            if not self.global_costmap_client.wait_for_service(timeout_sec=timeout):
+                return
+            response = self.call_service(
+                self.global_costmap_client, GetCostmap.Request(), timeout,
+            )
+            if response is None:
+                return
+            costmap = response.map
+            meta = costmap.metadata
+            def cost_at(x, y):
+                col = math.floor((x - meta.origin.position.x) / meta.resolution)
+                row = math.floor((y - meta.origin.position.y) / meta.resolution)
+                if not (0 <= col < meta.size_x and 0 <= row < meta.size_y):
+                    return "outside_map"
+                return int(costmap.data[row * meta.size_x + col])
+            start = transform.transform.translation
+            self.get_logger().error(
+                f"Blocked plan: start=({start.x:.3f}, {start.y:.3f}), "
+                f"start_cost={cost_at(start.x, start.y)}, "
+                f"goal=({goal_x:.3f}, {goal_y:.3f}), "
+                f"goal_cost={cost_at(goal_x, goal_y)}; "
+                "253=inside obstacle clearance, 254=obstacle, 255=unknown"
+            )
+        except Exception as exc:
+            self.get_logger().warn(f"Unable to inspect blocked plan costmap: {exc}")
+
     def navigation_feedback_callback(self, feedback_msg):
         distance = float(feedback_msg.feedback.distance_remaining)
         with self.state_lock:
-            self.active_goal_distance_remaining = distance
+            self.active_goal_distance_remaining = distance if distance > 0.0 else None
         now = time.time()
         if now - self.last_feedback_time < 1.0:
             return
-        self.get_logger().info(f"Navigation remaining distance: {distance:.2f} m")
+        if distance > 0.0:
+            self.get_logger().info(f"Navigation remaining distance: {distance:.2f} m")
+        else:
+            self.get_logger().info(
+                "Navigation path distance unavailable or zero; awaiting action result"
+            )
         self.last_feedback_time = now
 
     def stop_robot(self, reason):
@@ -2426,6 +3170,8 @@ class MissionDriver(Node):
     def set_active_mission_command(self, command):
         with self.state_lock:
             self.active_mission_command = command
+            if command == "START":
+                self.start_returning_home = False
 
     def set_manual_initial_pose_pending(self, pending):
         with self.state_lock:

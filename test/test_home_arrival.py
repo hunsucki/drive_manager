@@ -10,6 +10,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import TransformStamped
 from rclpy.task import Future
 from rclpy.time import Time
+from tf2_ros import TransformException
 import pytest
 import yaml
 
@@ -28,6 +29,7 @@ def make_driver():
         'home_alignment_max_attempts': 3,
         'home_alignment_timeout_sec': 15.0,
         'home_pose_max_age_sec': 0.5,
+        'home_pose_wait_timeout_sec': 5.0,
         'action_server_timeout': 1.0,
         'map_frame': 'map',
         'base_frame': 'base_link',
@@ -47,6 +49,20 @@ def make_driver():
     return driver
 
 
+@pytest.fixture
+def home_pose_clock(monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr('drive_manager.mission_driver.time.monotonic', lambda: clock.now)
+    return clock
+
+
+def use_home_pose_clock(driver, clock):
+    def advance(delay):
+        clock.now += delay
+        return driver.shutdown_event.is_set()
+    driver.shutdown_event.wait = Mock(side_effect=advance)
+
+
 def test_alignment_corrects_heading_then_checks_again():
     driver = make_driver()
     driver.get_home_pose_error = Mock(side_effect=[(0.10, 0.09), (0.11, -0.02)])
@@ -63,8 +79,9 @@ def test_already_aligned_does_not_rotate():
 
 
 @pytest.mark.parametrize('error', [(0.16, 0.01), ValueError('stale TF')])
-def test_invalid_position_blocks_rotation_and_handoff(error):
+def test_invalid_position_blocks_rotation_and_handoff(error, home_pose_clock):
     driver = make_driver()
+    use_home_pose_clock(driver, home_pose_clock)
     driver.get_home_pose_error = Mock()
     if isinstance(error, Exception):
         driver.get_home_pose_error.side_effect = error
@@ -73,6 +90,93 @@ def test_invalid_position_blocks_rotation_and_handoff(error):
     assert not driver.align_home_or_abort('HOME', (0.0, 0.0, 0.0))
     driver.spin_home_heading.assert_not_called()
     driver.publish_command_result.assert_called_once_with('HOME', False)
+
+
+def make_home_handoff_driver():
+    driver = make_driver()
+    driver.wait_for_robot_ready = Mock(return_value=True)
+    driver.prepare_navigation = Mock(return_value=True)
+    driver.get_pose3_parameter = Mock(return_value=(0.0, 0.0, 0.0))
+    driver.navigate_or_abort = Mock(return_value=True)
+    driver.pause_navigation = Mock(return_value=True)
+    driver.run_docking_step = Mock(return_value=True)
+    driver.finalize_docked_state = Mock()
+    return driver
+
+
+def test_home_waits_after_spin_and_hands_off_when_tf_recovers(home_pose_clock):
+    driver = make_home_handoff_driver()
+    use_home_pose_clock(driver, home_pose_clock)
+    driver.get_home_pose_error = Mock(side_effect=[
+        (0.111, math.radians(-3.76)),
+        ValueError('HOME pose TF is stale or future-dated: age=0.736s'),
+        TransformException('TF temporarily unavailable'),
+        (0.112, 0.01),
+    ])
+    driver.handle_home()
+    driver.spin_home_heading.assert_called_once_with(math.radians(-3.76))
+    assert driver.shutdown_event.wait.call_count == 2
+    assert driver.get_home_pose_error.call_count == 4
+    driver.pause_navigation.assert_called_once_with()
+    driver.run_docking_step.assert_called_once_with('HOME')
+    driver.publish_command_result.assert_called_once_with('HOME', True)
+    assert driver.publish_zero_velocity.call_count >= 4
+
+
+@pytest.mark.parametrize('error', [ValueError('stale TF'), TransformException('missing TF')])
+def test_home_pose_timeout_keeps_handoff_blocked(error, home_pose_clock):
+    driver = make_home_handoff_driver()
+    use_home_pose_clock(driver, home_pose_clock)
+    driver.get_home_pose_error = Mock(side_effect=error)
+    driver.handle_home()
+    assert home_pose_clock.now == pytest.approx(5.0)
+    driver.spin_home_heading.assert_not_called()
+    driver.pause_navigation.assert_not_called()
+    driver.run_docking_step.assert_not_called()
+    driver.publish_command_result.assert_called_once_with('HOME', False)
+
+
+@pytest.mark.parametrize('reason', ['interrupt', 'shutdown'])
+def test_home_pose_wait_stops_on_interrupt_or_shutdown(reason, home_pose_clock):
+    driver = make_home_handoff_driver()
+    driver.get_home_pose_error = Mock(side_effect=ValueError('stale TF'))
+    def interrupt_wait(delay):
+        home_pose_clock.now += delay
+        if reason == 'shutdown':
+            driver.shutdown_event.set()
+        else:
+            driver.has_interrupt_reason.return_value = True
+        return driver.shutdown_event.is_set()
+    driver.shutdown_event.wait = Mock(side_effect=interrupt_wait)
+    driver.handle_home()
+    assert driver.get_home_pose_error.call_count == 1
+    assert home_pose_clock.now <= 0.1
+    driver.spin_home_heading.assert_not_called()
+    driver.run_docking_step.assert_not_called()
+
+
+def test_fresh_pose_returning_after_deadline_does_not_allow_handoff(home_pose_clock):
+    driver = make_home_handoff_driver()
+    def late_pose(target_pose):
+        home_pose_clock.now += 5.1
+        return (0.1, 0.01)
+    driver.get_home_pose_error = Mock(side_effect=late_pose)
+    driver.handle_home()
+    driver.run_docking_step.assert_not_called()
+    driver.publish_command_result.assert_called_once_with('HOME', False)
+
+
+@pytest.mark.parametrize('timeout', [0.0, -1.0, float('nan'), float('inf')])
+def test_invalid_home_pose_wait_timeout_is_rejected(timeout):
+    driver = make_driver()
+    parameters = driver.get_parameter.side_effect
+    driver.get_parameter.side_effect = lambda name: (
+        SimpleNamespace(value=timeout) if name == 'home_pose_wait_timeout_sec'
+        else parameters(name)
+    )
+    driver.get_home_pose_error = Mock()
+    assert driver.wait_for_home_pose_error((0.0, 0.0, 0.0)) is None
+    driver.get_home_pose_error.assert_not_called()
 
 
 def test_position_drift_after_rotation_is_rejected():
@@ -177,6 +281,7 @@ def test_late_spin_acceptance_is_cancelled():
 @pytest.mark.parametrize('label', ['HOME_TO_DOCK', 'PATROL_1'])
 def test_only_home_navigation_uses_strict_tree(label):
     driver = make_driver()
+    driver.check_navigation_plan = Mock(return_value=True)
     driver.capture_stop_requested = False
     driver.discard_capture_stop_request = Mock()
     driver.navigation_feedback_callback = Mock()
@@ -215,6 +320,9 @@ def test_behavior_tree_plugin_ids_match_config_and_preserve_patrol():
 @pytest.mark.parametrize('alignment_ok', [True, False])
 def test_both_return_paths_align_before_pausing_and_docking(command, alignment_ok):
     driver = make_driver()
+    driver.get_node_names_and_namespaces = Mock(return_value=[])
+    driver.sensor_lock = threading.Lock()
+    driver.pose_mode = 'DOCKED'
     driver.get_parameter = Mock(return_value=SimpleNamespace(value=False))
     driver.get_pose3_parameter = Mock(return_value=(0.0, 0.0, 0.0))
     driver.get_patrol_points = Mock(return_value=[('point_1', 1.0, 1.0)])

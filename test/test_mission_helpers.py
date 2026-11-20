@@ -4,7 +4,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from action_msgs.msg import GoalStatus
 from drive_manager.mission_driver import (
@@ -12,18 +12,21 @@ from drive_manager.mission_driver import (
     capture_distance_reached,
     find_capture_zone,
     make_capture_zone,
+    map_id_from_yaml_path,
     MissionDriver,
     normalize_capture_zone_names,
     point_is_in_capture_zone,
     quaternion_to_yaw,
+    sensor_stamp_is_fresh,
     yaw_to_quaternion,
 )
 from drive_manager.web_teleop import clamp_twist
 
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from geometry_msgs.msg import Twist
 from inspection_interfaces.srv import (
     AbortCaptureRun,
+    CapturePair,
     FinishCaptureRun,
     StartCaptureRun,
 )
@@ -71,6 +74,66 @@ class MissionHelperTests(unittest.TestCase):
         self.assertTrue(capture_distance_reached(1.0, 1.0, None, 0.5))
         self.assertFalse(capture_distance_reached(1.3, 1.4, (1.0, 1.0), 0.51))
         self.assertTrue(capture_distance_reached(1.3, 1.4, (1.0, 1.0), 0.5))
+
+    def test_sensor_stamp_rejects_old_and_future_data(self):
+        stamp = SimpleNamespace(sec=100, nanosec=0)
+        self.assertTrue(sensor_stamp_is_fresh(stamp, 101.5, 2.0))
+        self.assertFalse(sensor_stamp_is_fresh(stamp, 103.0, 2.0))
+        self.assertFalse(sensor_stamp_is_fresh(stamp, 99.0, 2.0))
+
+    def test_localization_waits_through_one_stale_sensor_sample(self):
+        driver = MissionDriver.__new__(MissionDriver)
+        driver.shutdown_event = threading.Event()
+        driver.sensor_lock = threading.Lock()
+        driver.robot_is_ready = Mock(side_effect=[False, True])
+        driver.has_interrupt_reason = Mock(return_value=False)
+        driver.publish_zero_velocity = Mock()
+        driver.publish_initial_pose = Mock()
+        driver.publish_robot_pose_status = Mock()
+        driver.amcl_covariance_is_acceptable = Mock(return_value=True)
+        driver.transform_available = Mock(return_value=True)
+        driver.last_amcl_pose = PoseWithCovarianceStamped()
+        driver.last_amcl_received = 10.0
+        driver.amcl_sequence = 1
+        values = {
+            "localization_timeout_sec": 20.0,
+            "initial_pose_publish_period_sec": 0.5,
+            "amcl_stable_samples": 1,
+            "map_frame": "map",
+            "base_frame": "base_link",
+        }
+        driver.get_parameter = Mock(
+            side_effect=lambda name: SimpleNamespace(value=values[name])
+        )
+
+        with patch("drive_manager.mission_driver.time.monotonic", return_value=10.0), \
+             patch("drive_manager.mission_driver.time.sleep"):
+            self.assertTrue(driver.wait_for_localization((0.0, 0.0, 0.0)))
+
+        driver.publish_zero_velocity.assert_called_once()
+        driver.publish_initial_pose.assert_called_once()
+
+    def test_robot_loss_requires_sustained_stale_inputs(self):
+        driver = self.make_capture_driver()
+        driver.capture_stop_active = False
+        driver.robot_was_ready = True
+        driver.robot_loss_handling = False
+        driver.robot_unready_since = None
+        driver.robot_is_ready = Mock(side_effect=[False, False, True, False, False])
+        driver.describe_navigation_inputs = Mock(return_value="scan age=2.1s")
+        driver.start_robot_loss_handling = Mock()
+        driver.get_parameter = Mock(
+            return_value=SimpleNamespace(value=3.0)
+        )
+
+        with patch("drive_manager.mission_driver.time.monotonic",
+                   side_effect=[10.0, 11.0, 12.0, 16.0]):
+            for _ in range(4):
+                driver.robot_health_callback()
+            driver.start_robot_loss_handling.assert_not_called()
+            driver.robot_health_callback()
+
+        driver.start_robot_loss_handling.assert_called_once()
 
     def test_capture_zone_names_allow_any_ordered_count(self):
         self.assertEqual(
@@ -141,16 +204,24 @@ class MissionHelperTests(unittest.TestCase):
         driver.capture_run_id = "run_1"
         driver.capture_mission_id = "mission_test"
         driver.capture_request_sequence = 0
+        driver.capture_consecutive_failures = 0
         driver.active_goal_handle = Mock()
         driver.active_goal_label = "PATROL_1"
         driver.active_goal_distance_remaining = None
         parameter_values = {
             "capture_enabled": True,
+            "action_server_timeout": 1.0,
+            "stop_zero_seconds": 1.5,
             "capture_pose_timeout_sec": 2.0,
+            "capture_resume_timeout_sec": 10.0,
             "robot_message_timeout_sec": 2.0,
             "capture_trigger_min_linear_mps": 0.02,
             "capture_trigger_max_angular_rps": 0.15,
             "capture_goal_exclusion_radius_m": 0.30,
+            "capture_failure_stops_mission": False,
+            "capture_max_consecutive_failures": 1,
+            "map_frame": "map",
+            "base_frame": "base_link",
         }
         driver.get_parameter = Mock(
             side_effect=lambda name: SimpleNamespace(value=parameter_values[name])
@@ -162,6 +233,16 @@ class MissionHelperTests(unittest.TestCase):
         )
         driver.get_clock = Mock(return_value=SimpleNamespace(now=Mock(return_value=now)))
         driver.cancel_active_goal = Mock(return_value=True)
+        driver.shutdown_event = threading.Event()
+        driver.amcl_sequence = 0
+
+        def publish_stationary_amcl():
+            with driver.sensor_lock:
+                driver.amcl_sequence += 1
+                driver.last_amcl_received = time.monotonic()
+            return True
+
+        driver.request_stationary_amcl_update = Mock(side_effect=publish_stationary_amcl)
         return driver
 
     def test_capture_timer_requests_stop_on_entry_then_after_distance(self):
@@ -205,6 +286,24 @@ class MissionHelperTests(unittest.TestCase):
         stale_driver.capture_timer_callback(now_monotonic=12.1)
         stale_driver.cancel_active_goal.assert_not_called()
 
+    def test_stale_pose_during_capture_preserves_distance_and_zone(self):
+        driver = self.make_capture_driver()
+        driver.current_capture_zone = "A"
+        driver.last_capture_position = (1.0, 1.0)
+        driver.capture_in_progress = True
+        driver.last_amcl_received = 10.0
+
+        driver.capture_timer_callback(now_monotonic=12.1)
+
+        self.assertEqual(driver.current_capture_zone, "A")
+        self.assertEqual(driver.last_capture_position, (1.0, 1.0))
+        driver.capture_in_progress = False
+        driver.last_amcl_received = 12.2
+        driver.last_odom_received = 12.2
+        driver.last_amcl_pose.pose.pose.position.x = 1.25
+        driver.capture_timer_callback(now_monotonic=12.3)
+        driver.cancel_active_goal.assert_not_called()
+
     def test_capture_timer_rejects_home_to_dock_and_waypoint_yaw_alignment(self):
         return_driver = self.make_capture_driver()
         return_driver.active_goal_label = "HOME_TO_DOCK"
@@ -233,6 +332,7 @@ class MissionHelperTests(unittest.TestCase):
         driver.last_amcl_received = time.monotonic()
         driver.wait_until_robot_stopped = Mock(return_value=True)
         driver.execute_capture_request = Mock(return_value=True)
+        driver.wait_for_capture_resume_ready = Mock(return_value=True)
         driver.publish_status = Mock()
 
         self.assertTrue(driver.perform_stopped_capture())
@@ -246,6 +346,361 @@ class MissionHelperTests(unittest.TestCase):
         self.assertEqual(driver.last_capture_position, (1.0, 1.0))
         self.assertFalse(driver.capture_in_progress)
         self.assertFalse(driver.capture_stop_active)
+        driver.wait_for_capture_resume_ready.assert_called_once_with()
+
+    def test_capture_resume_accepts_stationary_pose_with_fresh_map_tf(self):
+        driver = self.make_capture_driver()
+        driver.shutdown_event = threading.Event()
+        driver.last_amcl_received = time.monotonic() - 10.0
+        driver.has_interrupt_reason = Mock(return_value=False)
+        driver.publish_zero_velocity = Mock()
+        driver.robot_is_ready = Mock(return_value=True)
+        driver.amcl_covariance_is_acceptable = Mock(return_value=True)
+        driver.transform_is_fresh = Mock(return_value=True)
+
+        self.assertTrue(driver.wait_for_capture_resume_ready())
+        driver.publish_zero_velocity.assert_called_once_with()
+        driver.transform_is_fresh.assert_called_once_with("map", "base_link", 2.0)
+
+    def make_stale_stopped_capture_driver(self):
+        driver = self.make_capture_driver()
+        driver.shutdown_event = threading.Event()
+        driver.capture_stop_requested = True
+        driver.capture_stop_zone = "A"
+        driver.capture_in_progress = True
+        driver.last_amcl_received = time.monotonic() - 3.0
+        driver.wait_until_robot_stopped = Mock(return_value=True)
+        driver.execute_capture_request = Mock()
+        driver.wait_for_capture_resume_ready = Mock(return_value=True)
+        driver.publish_status = Mock()
+        driver.publish_zero_velocity = Mock()
+        # AMCL does not answer the stationary update request.
+        driver.request_stationary_amcl_update = Mock(return_value=False)
+        original_get_parameter = driver.get_parameter
+        driver.get_parameter = Mock(side_effect=lambda name: (
+            SimpleNamespace(value=0.2) if name == "capture_pose_timeout_sec"
+            else original_get_parameter(name)
+        ))
+        return driver
+
+    def test_stopped_capture_refreshes_stale_pose_with_stationary_amcl_update(self):
+        driver = self.make_stale_stopped_capture_driver()
+        old_pose = driver.last_amcl_pose
+
+        def publish_stopped_pose():
+            pose = PoseWithCovarianceStamped()
+            pose.pose.pose.position.x = 1.2
+            pose.pose.pose.position.y = 0.9
+            with driver.sensor_lock:
+                driver.last_amcl_pose = pose
+                driver.amcl_sequence += 1
+                driver.last_amcl_received = time.monotonic()
+            return True
+
+        driver.request_stationary_amcl_update = Mock(side_effect=publish_stopped_pose)
+        driver.execute_capture_request = Mock(return_value=True)
+
+        self.assertTrue(driver.perform_stopped_capture())
+
+        driver.request_stationary_amcl_update.assert_called_once_with()
+        request = driver.execute_capture_request.call_args.args[0]
+        self.assertAlmostEqual(request.robot_pose.pose.pose.position.x, 1.2)
+        self.assertAlmostEqual(request.robot_pose.pose.pose.position.y, 0.9)
+        self.assertIsNot(request.robot_pose, old_pose)
+        self.assertEqual(driver.last_capture_position, (1.2, 0.9))
+        self.assertEqual(driver.capture_consecutive_failures, 0)
+        self.assertTrue(driver.capture_accepting_requests)
+
+    def test_stopped_capture_falls_back_to_fresh_pose_without_amcl_update(self):
+        driver = self.make_stale_stopped_capture_driver()
+        driver.last_amcl_received = time.monotonic()
+        driver.execute_capture_request = Mock(return_value=True)
+
+        self.assertTrue(driver.perform_stopped_capture())
+
+        self.assertGreaterEqual(driver.request_stationary_amcl_update.call_count, 1)
+        request = driver.execute_capture_request.call_args.args[0]
+        self.assertAlmostEqual(request.robot_pose.pose.pose.position.x, 1.0)
+        self.assertTrue(driver.capture_accepting_requests)
+
+    def test_stopped_capture_pose_wait_stops_on_interrupt(self):
+        driver = self.make_stale_stopped_capture_driver()
+        driver.request_stationary_amcl_update = Mock(
+            side_effect=lambda: driver.set_interrupt_reason("STOP")
+        )
+
+        self.assertFalse(driver.perform_stopped_capture())
+
+        driver.execute_capture_request.assert_not_called()
+        driver.wait_for_capture_resume_ready.assert_not_called()
+        self.assertEqual(driver.capture_consecutive_failures, 0)
+        self.assertFalse(driver.capture_stop_active)
+
+    def test_optional_stale_capture_pose_resumes_same_navigation_goal(self):
+        driver = self.make_stale_stopped_capture_driver()
+        driver.nav_client = Mock()
+        driver.nav_client.wait_for_server.return_value = True
+        driver.check_navigation_plan = Mock(return_value=True)
+        driver.make_pose_stamped = Mock(return_value=PoseStamped())
+        driver.navigation_feedback_callback = Mock()
+        driver.wait_for_future = Mock(side_effect=[
+            Mock(accepted=True),
+            SimpleNamespace(status=GoalStatus.STATUS_CANCELED, result=Mock()),
+            Mock(accepted=True),
+            SimpleNamespace(status=GoalStatus.STATUS_SUCCEEDED, result=Mock()),
+        ])
+
+        self.assertTrue(driver.navigate_to_named_pose("PATROL_2", 4.666, -0.023, 3.0))
+
+        self.assertEqual(driver.nav_client.send_goal_async.call_count, 2)
+        for call in driver.make_pose_stamped.call_args_list:
+            self.assertEqual(call.args, (4.666, -0.023, 3.0))
+        driver.execute_capture_request.assert_not_called()
+        driver.wait_for_capture_resume_ready.assert_called_once_with()
+        self.assertIsNone(driver.interrupt_reason)
+        self.assertFalse(driver.capture_accepting_requests)
+        self.assertFalse(driver.capture_in_progress)
+        self.assertFalse(driver.capture_stop_active)
+        driver.publish_status.assert_any_call("NAVIGATING PATROL_2")
+
+    def test_optional_missing_capture_pose_still_waits_for_sensors(self):
+        driver = self.make_stale_stopped_capture_driver()
+        driver.last_amcl_pose = None
+        driver.last_amcl_received = None
+        driver.wait_for_capture_resume_ready.return_value = False
+        driver.robot_is_ready = Mock(return_value=False)
+        driver.start_robot_loss_handling = Mock(
+            side_effect=lambda: driver.set_interrupt_reason("ROBOT_LOST")
+        )
+
+        self.assertFalse(driver.perform_stopped_capture())
+
+        driver.execute_capture_request.assert_not_called()
+        driver.start_robot_loss_handling.assert_called_once_with()
+        self.assertEqual(driver.interrupt_reason, "ROBOT_LOST")
+        self.assertFalse(driver.capture_stop_active)
+
+    def test_required_capture_pose_failure_still_aborts(self):
+        driver = self.make_stale_stopped_capture_driver()
+        original_get_parameter = driver.get_parameter
+        driver.get_parameter = Mock(side_effect=lambda name: (
+            SimpleNamespace(value=True) if name == "capture_failure_stops_mission"
+            else original_get_parameter(name)
+        ))
+
+        self.assertFalse(driver.perform_stopped_capture())
+
+        self.assertEqual(driver.interrupt_reason, "CAPTURE_CONTROL_FAILED")
+        driver.execute_capture_request.assert_not_called()
+        driver.wait_for_capture_resume_ready.assert_not_called()
+        driver.publish_status.assert_any_call("ERROR capture_control_failed")
+
+    def test_capture_service_exceptions_are_reported_as_failed_responses(self):
+        driver = self.make_capture_driver()
+        driver.get_parameter = Mock(return_value=SimpleNamespace(value=0.1))
+        driver.capture_clients = {op: Mock() for op in ("start", "capture", "finish", "abort")}
+        driver.call_service = Mock(side_effect=RuntimeError("camera disconnected"))
+        for operation in driver.capture_clients:
+            with self.subTest(operation=operation):
+                self.assertIsNone(driver.call_capture_service(operation, object()))
+        self.assertIsNone(driver.interrupt_reason)
+
+    def test_capture_resume_refreshes_stationary_amcl_covariance(self):
+        driver = self.make_capture_driver()
+        driver.shutdown_event = threading.Event()
+        driver.publish_zero_velocity = Mock()
+        driver.robot_is_ready = Mock(return_value=True)
+        driver.amcl_covariance_is_acceptable = Mock(side_effect=[False, True])
+        driver.transform_is_fresh = Mock(return_value=True)
+        driver.request_stationary_amcl_update = Mock(return_value=True)
+
+        with patch("drive_manager.mission_driver.time.sleep"):
+            self.assertTrue(driver.wait_for_capture_resume_ready())
+
+        driver.request_stationary_amcl_update.assert_called_once_with()
+        self.assertIsNone(driver.interrupt_reason)
+
+    def test_capture_resume_refreshes_stale_map_tf(self):
+        driver = self.make_capture_driver()
+        driver.shutdown_event = threading.Event()
+        driver.publish_zero_velocity = Mock()
+        driver.robot_is_ready = Mock(return_value=True)
+        driver.amcl_covariance_is_acceptable = Mock(return_value=True)
+        driver.transform_is_fresh = Mock(side_effect=[False, True])
+        driver.request_stationary_amcl_update = Mock(return_value=True)
+
+        with patch("drive_manager.mission_driver.time.sleep"):
+            self.assertTrue(driver.wait_for_capture_resume_ready())
+
+        driver.request_stationary_amcl_update.assert_called_once_with()
+
+    def test_capture_resume_timeout_reports_the_failing_condition(self):
+        driver = self.make_capture_driver()
+        driver.shutdown_event = threading.Event()
+        driver.publish_zero_velocity = Mock()
+        driver.robot_is_ready = Mock(return_value=True)
+        driver.amcl_covariance_is_acceptable = Mock(return_value=False)
+        driver.describe_navigation_inputs = Mock(return_value="amcl_covariance=(0.8, 0.6, 0.7)")
+        driver.request_stationary_amcl_update = Mock()
+        with patch("drive_manager.mission_driver.time.monotonic", side_effect=[0.0, 11.0]):
+            self.assertFalse(driver.wait_for_capture_resume_ready())
+
+        error = driver.get_logger().error.call_args.args[0]
+        self.assertIn("covariance is not acceptable", error)
+        self.assertIn("amcl_covariance=(0.8, 0.6, 0.7)", error)
+        driver.request_stationary_amcl_update.assert_not_called()
+
+    def test_capture_resume_localization_failure_preserves_amcl(self):
+        driver = self.make_capture_driver()
+        driver.shutdown_event = threading.Event()
+        driver.capture_stop_requested = True
+        driver.capture_stop_zone = "A"
+        driver.last_amcl_received = time.monotonic()
+        driver.wait_until_robot_stopped = Mock(return_value=True)
+        driver.execute_capture_request = Mock(return_value=False)
+        driver.wait_for_capture_resume_ready = Mock(return_value=False)
+        driver.robot_is_ready = Mock(return_value=True)
+        driver.publish_status = Mock()
+        driver.handle_capture_control_failure = Mock()
+        driver.pause_navigation = Mock(return_value=True)
+        driver.start_robot_loss_handling = Mock()
+
+        self.assertFalse(driver.perform_stopped_capture())
+
+        driver.pause_navigation.assert_called_once_with()
+        driver.start_robot_loss_handling.assert_not_called()
+        driver.handle_capture_control_failure.assert_called_once()
+        self.assertFalse(driver.capture_stop_active)
+
+    def test_capture_resume_sensor_failure_still_stops_robot(self):
+        driver = self.make_capture_driver()
+        driver.shutdown_event = threading.Event()
+        driver.capture_stop_requested = True
+        driver.capture_stop_zone = "A"
+        driver.last_amcl_received = time.monotonic()
+        driver.wait_until_robot_stopped = Mock(return_value=True)
+        driver.execute_capture_request = Mock(return_value=False)
+        driver.wait_for_capture_resume_ready = Mock(return_value=False)
+        driver.robot_is_ready = Mock(return_value=False)
+        driver.publish_status = Mock()
+        driver.pause_navigation = Mock()
+        driver.start_robot_loss_handling = Mock()
+
+        self.assertFalse(driver.perform_stopped_capture())
+
+        driver.start_robot_loss_handling.assert_called_once_with()
+        driver.pause_navigation.assert_not_called()
+
+    def test_optional_camera_failure_does_not_stop_again_in_next_zone(self):
+        driver = self.make_capture_driver()
+        request = SimpleNamespace(request_id="request_1", zone_id="A")
+
+        driver.handle_capture_failure(request, "capture pair incomplete")
+        driver.capture_timer_callback(now_monotonic=10.0)
+
+        self.assertFalse(driver.capture_accepting_requests)
+        self.assertIsNone(driver.interrupt_reason)
+        driver.cancel_active_goal.assert_not_called()
+
+    def test_successful_capture_resets_consecutive_camera_failures(self):
+        driver = self.make_capture_driver()
+        driver.capture_consecutive_failures = 1
+        request = SimpleNamespace(run_id="run_1", request_id="request_2", zone_id="A")
+        response = CapturePair.Response()
+        response.success = True
+        response.run_id = request.run_id
+        response.request_id = request.request_id
+        driver.call_capture_service = Mock(return_value=response)
+
+        self.assertTrue(driver.execute_capture_request(request))
+        self.assertEqual(driver.capture_consecutive_failures, 0)
+
+    def test_one_camera_keeps_saving_across_capture_requests(self):
+        for side in ("left", "right"):
+            with self.subTest(saved_side=side):
+                driver = self.make_capture_driver()
+                driver.capture_consecutive_failures = 1
+                for index in range(2):
+                    request = SimpleNamespace(
+                        run_id="run_1", request_id=f"request_{index}", zone_id="A"
+                    )
+                    response = CapturePair.Response()
+                    response.success = False
+                    response.message = "capture pair incomplete"
+                    response.run_id = request.run_id
+                    response.request_id = request.request_id
+                    setattr(response, f"{side}_file", f"{side}/{index}.jpg")
+                    other_side = "right" if side == "left" else "left"
+                    setattr(response, f"{other_side}_error", "cannot open RTSP stream")
+                    driver.call_capture_service = Mock(return_value=response)
+
+                    self.assertTrue(driver.execute_capture_request(request))
+                    self.assertTrue(driver.capture_accepting_requests)
+                    self.assertEqual(driver.capture_consecutive_failures, 0)
+                    self.assertIsNone(driver.interrupt_reason)
+                    self.assertFalse(driver.capture_in_progress)
+
+                driver.capture_timer_callback(now_monotonic=10.1)
+                driver.cancel_active_goal.assert_called_once_with(context="zone capture")
+                self.assertTrue(driver.capture_stop_requested)
+
+    def test_partial_capture_with_wrong_identity_is_rejected(self):
+        for field in ("run_id", "request_id"):
+            with self.subTest(mismatched_field=field):
+                driver = self.make_capture_driver()
+                request = SimpleNamespace(run_id="run_1", request_id="request_1", zone_id="A")
+                response = CapturePair.Response()
+                response.run_id = request.run_id
+                response.request_id = request.request_id
+                response.left_file = "left/1.jpg"
+                setattr(response, field, "unrelated")
+                driver.call_capture_service = Mock(return_value=response)
+
+                self.assertFalse(driver.execute_capture_request(request))
+                self.assertFalse(driver.capture_accepting_requests)
+                self.assertEqual(driver.capture_consecutive_failures, 1)
+
+    def test_both_cameras_failing_still_disables_remaining_optional_captures(self):
+        driver = self.make_capture_driver()
+        request = SimpleNamespace(run_id="run_1", request_id="request_1", zone_id="A")
+        response = CapturePair.Response()
+        response.run_id = request.run_id
+        response.request_id = request.request_id
+        response.left_error = "left disconnected"
+        response.right_error = "right disconnected"
+        driver.call_capture_service = Mock(return_value=response)
+
+        self.assertFalse(driver.execute_capture_request(request))
+
+        self.assertFalse(driver.capture_accepting_requests)
+        self.assertEqual(driver.capture_consecutive_failures, 1)
+        self.assertIsNone(driver.interrupt_reason)
+        self.assertFalse(driver.capture_in_progress)
+
+    def test_robot_health_does_not_reset_nav2_during_stopped_capture(self):
+        driver = self.make_capture_driver()
+        driver.capture_stop_active = True
+        driver.robot_is_ready = Mock(return_value=False)
+        driver.start_robot_loss_handling = Mock()
+
+        driver.robot_health_callback()
+
+        driver.start_robot_loss_handling.assert_not_called()
+
+    def test_failed_stop_aborts_mission_even_when_camera_failures_are_optional(self):
+        driver = self.make_capture_driver()
+        driver.publish_zero_velocity = Mock()
+        driver.publish_status = Mock()
+        driver.get_parameter = Mock(side_effect=lambda name: SimpleNamespace(value={
+            "stop_zero_seconds": 2.0,
+            "capture_failure_stops_mission": False,
+        }[name]))
+
+        driver.handle_capture_control_failure("A", "odometry stayed in motion")
+
+        self.assertEqual(driver.interrupt_reason, "CAPTURE_CONTROL_FAILED")
+        driver.publish_zero_velocity.assert_called_once_with()
+        driver.publish_status.assert_called_once_with("ERROR capture_control_failed")
 
     def test_wait_until_robot_stopped_accepts_fresh_stationary_odometry(self):
         driver = MissionDriver.__new__(MissionDriver)
@@ -270,7 +725,7 @@ class MissionHelperTests(unittest.TestCase):
         self.assertTrue(driver.wait_until_robot_stopped())
         driver.publish_zero_velocity.assert_called()
 
-    def test_navigation_resends_same_goal_after_stopped_capture(self):
+    def test_navigation_resends_same_goal_after_optional_capture_failure(self):
         driver = MissionDriver.__new__(MissionDriver)
         driver.shutdown_event = threading.Event()
         driver.state_lock = threading.Lock()
@@ -294,6 +749,7 @@ class MissionHelperTests(unittest.TestCase):
         first_goal.get_result_async.return_value = object()
         second_goal.get_result_async.return_value = object()
         driver.nav_client = Mock()
+        driver.check_navigation_plan = Mock(return_value=True)
         driver.nav_client.wait_for_server.return_value = True
         driver.nav_client.send_goal_async.side_effect = [object(), object()]
         driver.wait_for_future = Mock(
@@ -308,7 +764,7 @@ class MissionHelperTests(unittest.TestCase):
         def complete_capture():
             driver.capture_stop_requested = False
             driver.capture_in_progress = False
-            return True
+            return False
 
         driver.perform_stopped_capture = Mock(side_effect=complete_capture)
 
@@ -331,6 +787,7 @@ class MissionHelperTests(unittest.TestCase):
         driver.capture_run_id = ""
         driver.capture_mission_id = ""
         driver.capture_request_sequence = 0
+        driver.capture_consecutive_failures = 1
         driver.current_capture_zone = None
         driver.last_capture_position = None
         driver.capture_stop_requested = False
@@ -339,7 +796,7 @@ class MissionHelperTests(unittest.TestCase):
         driver.last_capture_directory = ""
         parameter_values = {
             "capture_enabled": True,
-            "capture_map_id": "map_0903",
+            "navigation_map_yaml": "/root/map_0903.yaml",
             "map_frame": "map",
             "capture_zone_revision": "zones_test",
         }
@@ -351,6 +808,20 @@ class MissionHelperTests(unittest.TestCase):
         driver.get_logger = Mock(return_value=Mock())
         driver.call_capture_service = Mock()
         return driver
+
+    def test_capture_map_id_follows_navigation_map_file(self):
+        self.assertEqual(map_id_from_yaml_path("~/map_1031.yaml"), "map_1031")
+        self.assertEqual(map_id_from_yaml_path("/maps/map_1005-2.yml"), "map_1005-2")
+        self.assertEqual(map_id_from_yaml_path(""), "")
+
+    def test_capture_map_id_uses_map_server_when_navigation_map_is_unset(self):
+        driver = self.make_capture_run_driver()
+        driver.get_parameter = Mock(return_value=SimpleNamespace(value=""))
+        driver.get_loaded_map_yaml = Mock(return_value="/root/map_1031.yaml")
+        self.assertEqual(driver.get_capture_map_id(), "map_1031")
+
+        driver.get_loaded_map_yaml = Mock(return_value=None)
+        self.assertEqual(driver.get_capture_map_id(), "unknown_map")
 
     def test_start_capture_run_sends_zone_snapshot_and_stores_run_id(self):
         driver = self.make_capture_run_driver()
@@ -370,6 +841,7 @@ class MissionHelperTests(unittest.TestCase):
         self.assertTrue(driver.capture_run_active)
         self.assertTrue(driver.capture_accepting_requests)
         self.assertEqual(driver.capture_run_id, "run_7")
+        self.assertEqual(driver.capture_consecutive_failures, 0)
 
     def test_start_capture_run_accepts_only_configured_zone_subset(self):
         driver = self.make_capture_run_driver()
@@ -563,6 +1035,7 @@ class MissionHelperTests(unittest.TestCase):
 
     def test_prepare_navigation_republishes_manual_initial_pose(self):
         driver = MissionDriver.__new__(MissionDriver)
+        driver.get_node_names_and_namespaces = Mock(return_value=[])
         driver.sensor_lock = threading.Lock()
         driver.pose_mode = "UNKNOWN"
         driver.nav2_expected_active = False
@@ -573,6 +1046,7 @@ class MissionHelperTests(unittest.TestCase):
         driver.robot_is_ready = Mock(return_value=True)
         driver.publish_status = Mock()
         driver.call_supervisor = Mock(return_value=True)
+        driver.navigation_map_matches = Mock(return_value=True)
         driver.wait_for_localization = Mock(return_value=True)
         driver.clear_costmaps = Mock(return_value=True)
 
@@ -583,6 +1057,45 @@ class MissionHelperTests(unittest.TestCase):
         driver.wait_for_localization.assert_called_once_with(initial_pose)
         self.assertEqual(driver.pose_mode, "LOCALIZING")
         self.assertTrue(driver.nav2_expected_active)
+
+    def test_navigation_rejects_a_different_map_before_localizing(self):
+        driver = MissionDriver.__new__(MissionDriver)
+        driver.get_node_names_and_namespaces = Mock(return_value=[])
+        driver.get_parameter = Mock(return_value=SimpleNamespace(value=True))
+        driver.robot_is_ready = Mock(return_value=True)
+        driver.publish_status = Mock()
+        driver.call_supervisor = Mock(return_value=True)
+        driver.navigation_map_matches = Mock(return_value=False)
+        driver.wait_for_localization = Mock()
+
+        self.assertFalse(driver.prepare_navigation(initial_pose=(0.0, 0.0, 0.0)))
+
+        driver.wait_for_localization.assert_not_called()
+        driver.call_supervisor.assert_called_once_with("start_localization")
+
+    def test_map_server_must_match_the_mission_map(self):
+        driver = MissionDriver.__new__(MissionDriver)
+        driver.get_parameter = Mock(return_value=SimpleNamespace(value="~/map_1005-2.yaml"))
+        driver.get_logger = Mock(return_value=Mock())
+        driver.map_parameters_client = Mock()
+        driver.call_service = Mock(return_value=SimpleNamespace(
+            values=[SimpleNamespace(string_value="/root/map_1005-1.yaml")]
+        ))
+
+        self.assertFalse(driver.navigation_map_matches())
+
+        self.assertIn("Navigation map mismatch", driver.get_logger().error.call_args.args[0])
+        driver.call_service.return_value.values[0].string_value = "/root/map_1005-2.yaml"
+        self.assertTrue(driver.navigation_map_matches())
+
+    def test_missing_map_server_response_blocks_navigation(self):
+        driver = MissionDriver.__new__(MissionDriver)
+        driver.get_parameter = Mock(return_value=SimpleNamespace(value="/root/map_1005-2.yaml"))
+        driver.get_logger = Mock(return_value=Mock())
+        driver.map_parameters_client = Mock()
+        driver.call_service = Mock(return_value=None)
+
+        self.assertFalse(driver.navigation_map_matches())
 
     def make_command_driver(self, web_teleop_active):
         driver = MissionDriver.__new__(MissionDriver)

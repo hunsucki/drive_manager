@@ -206,7 +206,9 @@ local_costmap:
       footprint: "[[0.23, 0.22], [0.23, -0.22], [-0.23, -0.22], [-0.23, 0.22]]"
       footprint_padding: 0.01
       transform_tolerance: 0.5
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      # Local collision checks use current scan observations in odom. The
+      # static map remains in global_costmap for route planning.
+      plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
@@ -262,6 +264,9 @@ global_costmap:
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
+        # A stale map cell inside the robot body must not trap the planner's
+        # start cell. ObstacleLayer and CollisionMonitor still use live scans.
+        footprint_clearing_enabled: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0

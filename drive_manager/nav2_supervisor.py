@@ -5,6 +5,7 @@ import time
 
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.srv import ManageLifecycleNodes
+from rcl_interfaces.srv import GetParameters
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
@@ -12,6 +13,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+
+from drive_manager.stack_health import duplicate_stack_nodes
 
 
 class Nav2Supervisor(Node):
@@ -71,18 +74,15 @@ class Nav2Supervisor(Node):
                 callback_group=self.callback_group,
             ),
         }
-        self.state_clients = {
-            "localization": self.create_client(
-                GetState,
-                "/map_server/get_state",
+        self.node_names_clients = {
+            manager: self.create_client(
+                GetParameters,
+                f"/lifecycle_manager_{manager}/get_parameters",
                 callback_group=self.callback_group,
-            ),
-            "navigation": self.create_client(
-                GetState,
-                "/controller_server/get_state",
-                callback_group=self.callback_group,
-            ),
+            ) for manager in self.manager_clients
         }
+        self.state_clients = {}
+        self.last_node_states = {}
 
         self.create_service(
             Trigger,
@@ -145,6 +145,9 @@ class Nav2Supervisor(Node):
     def pause_navigation_callback(self, request, response):
         del request
         with self.transition_lock:
+            if not self.stack_is_unique():
+                self.publish_status("ERROR")
+                return self.fill_response(response, False, "duplicate Nav2/mission nodes")
             activity = self.get_manager_activity("navigation")
             if activity is None:
                 success = False
@@ -170,6 +173,9 @@ class Nav2Supervisor(Node):
     def reset_all_callback(self, request, response):
         del request
         with self.transition_lock:
+            if not self.stack_is_unique():
+                self.publish_status("ERROR")
+                return self.fill_response(response, False, "duplicate Nav2/mission nodes")
             self.publish_status("RESETTING")
             navigation_ok = self.reset_manager("navigation")
             localization_ok = self.reset_manager("localization")
@@ -189,6 +195,9 @@ class Nav2Supervisor(Node):
         return self.fill_response(response, True, self.current_status)
 
     def ensure_manager_active(self, manager):
+        if not self.stack_is_unique():
+            self.publish_status("ERROR")
+            return False
         if self.manager_is_active(manager):
             self.manager_states[manager] = "active"
             self.publish_status(f"{manager.upper()}_ACTIVE")
@@ -209,10 +218,10 @@ class Nav2Supervisor(Node):
                 self.publish_status(f"{manager.upper()}_ACTIVE")
                 return True
 
-        if lifecycle_state == "inactive":
-            self.send_manager_command(manager, ManageLifecycleNodes.Request.CLEANUP)
-        elif lifecycle_state != "unconfigured":
-            self.send_manager_command(manager, ManageLifecycleNodes.Request.RESET)
+        if lifecycle_state != "unconfigured" and not self.reset_manager(manager):
+            self.manager_states[manager] = "unknown"
+            self.publish_status("ERROR")
+            return False
         if not self.send_manager_command(manager, ManageLifecycleNodes.Request.STARTUP):
             self.manager_states[manager] = "unknown"
             self.publish_status("ERROR")
@@ -224,6 +233,8 @@ class Nav2Supervisor(Node):
         return success
 
     def reset_manager(self, manager):
+        if not self.stack_is_unique():
+            return False
         client = self.manager_clients[manager]
         timeout = float(self.get_parameter("service_timeout_sec").value)
         if not client.wait_for_service(timeout_sec=min(timeout, 2.0)):
@@ -235,40 +246,78 @@ class Nav2Supervisor(Node):
             self.manager_states[manager] = "unconfigured"
             return True
 
+        if lifecycle_state in ("unknown", "inconsistent"):
+            self.get_logger().error(
+                f"Cannot reset {manager}: managed node states are {lifecycle_state}; "
+                "stop duplicate launches and restart one drive_manager launch"
+            )
+            return False
+
         command = (
             ManageLifecycleNodes.Request.CLEANUP
             if lifecycle_state == "inactive"
             else ManageLifecycleNodes.Request.RESET
         )
-        if self.send_manager_command(manager, command):
+        command_ok = self.send_manager_command(manager, command)
+        # Inactive is not unconfigured. A failed reset may have deactivated only
+        # some nodes; never hide that failure using a cached or manager flag.
+        actual_state = self.get_manager_state(manager)
+        if command_ok and actual_state == "unconfigured":
             self.manager_states[manager] = "unconfigured"
             return True
-        if self.manager_states[manager] == "unconfigured":
-            return True
-        if not self.manager_is_active(manager):
-            self.get_logger().info(f"{manager} is already inactive")
-            self.manager_states[manager] = "unconfigured"
-            return True
+        self.manager_states[manager] = "unknown"
+        self.get_logger().error(
+            f"{manager} reset failed: command_success={command_ok}, "
+            f"actual_state={actual_state}, nodes={self.last_node_states.get(manager, {})}"
+        )
         return False
 
     def get_manager_state(self, manager):
-        client = self.state_clients[manager]
         timeout = float(self.get_parameter("service_timeout_sec").value)
-        if not client.wait_for_service(timeout_sec=min(timeout, 2.0)):
-            return "unknown"
+        if manager not in self.state_clients:
+            client = self.node_names_clients[manager]
+            if not client.wait_for_service(timeout_sec=min(timeout, 2.0)):
+                return "unknown"
+            request = GetParameters.Request()
+            request.names = ["node_names"]
+            result = self.call_service(client, request, min(timeout, 5.0))
+            if result is None or not result.values or not result.values[0].string_array_value:
+                return "unknown"
+            self.state_clients[manager] = {
+                name: self.create_client(
+                    GetState, f"/{name.strip('/')}/get_state",
+                    callback_group=self.callback_group,
+                ) for name in result.values[0].string_array_value
+            }
 
-        result = self.call_service(client, GetState.Request(), min(timeout, 5.0))
-        if result is None:
-            return "unknown"
-        states = {
-            1: "unconfigured",
-            2: "inactive",
-            3: "active",
-        }
-        return states.get(result.current_state.id, "unknown")
+        states = {}
+        for name, client in self.state_clients[manager].items():
+            result = None
+            if client.wait_for_service(timeout_sec=min(timeout, 2.0)):
+                result = self.call_service(client, GetState.Request(), min(timeout, 5.0))
+            states[name] = {1: "unconfigured", 2: "inactive", 3: "active"}.get(
+                result.current_state.id if result is not None else None, "unknown"
+            )
+        self.last_node_states[manager] = states
+        unique_states = set(states.values())
+        if len(unique_states) == 1:
+            return next(iter(unique_states))
+        self.get_logger().error(f"Inconsistent {manager} lifecycle states: {states}")
+        return "inconsistent"
+
+    def stack_is_unique(self):
+        duplicates = duplicate_stack_nodes(self.get_node_names_and_namespaces())
+        if duplicates:
+            self.get_logger().error(
+                "Duplicate Nav2/mission nodes: " + ", ".join(duplicates)
+                + "; stop duplicate launches before sending lifecycle commands"
+            )
+            return False
+        return True
 
     def manager_is_active(self, manager):
-        return self.get_manager_activity(manager) is True
+        return (self.get_manager_activity(manager) is True
+                and self.get_manager_state(manager) == "active")
 
     def get_manager_activity(self, manager):
         client = self.active_clients[manager]
@@ -291,6 +340,8 @@ class Nav2Supervisor(Node):
         return False
 
     def send_manager_command(self, manager, command):
+        if not self.stack_is_unique():
+            return False
         client = self.manager_clients[manager]
         timeout = float(self.get_parameter("service_timeout_sec").value)
         if not client.wait_for_service(timeout_sec=timeout):
